@@ -1,0 +1,18 @@
+# Core data handling
+pandas>=2.0
+
+# Model inference and local model loading
+torch
+transformers>=4.40
+huggingface_hub>=0.23
+safetensors>=0.4
+accelerate>=0.30
+
+# Tokenizer/runtime utilities often needed by local LLM/tokenizer stacks
+tokenizers>=0.15
+sentencepiece>=0.2
+protobuf>=4.25
+
+# Optional note:
+# bitsandbytes is only needed when using --local-llm-load-in-4bit or --local-llm-load-in-8bit.
+# On Windows, install it only if you know your environment supports it.

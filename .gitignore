@@ -1,0 +1,69 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Local experiment outputs
+# =========================
+Scripts_code/outputs/*
+!Scripts_code/outputs/.gitkeep
+*.log
+
+# =========================
+# Local data and model artifacts
+# These are intentionally not versioned.
+# See docs/LOCAL_ARTIFACTS.md.
+# =========================
+Automated Deception Classifier (Projectfolder)/
+
+# Dataset / result files that should not be accidentally committed
+*.csv
+*.tsv
+*.jsonl
+
+# Large model/checkpoint files
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.ckpt
+
+# Hugging Face / model caches
+.cache/
+**/.cache/
+CACHEDIR.TAG
+
+# =========================
+# Papers, thesis drafts, and local documents
+# =========================
+*.pdf
+*.docx
+*.zip
+Research_papers_to_use/
+Relatedwork/
+
+# =========================
+# OS/editor files
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
