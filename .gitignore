@@ -67,3 +67,6 @@ Relatedwork/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local file-tree/debug exports
+project-files.txt
