@@ -33,6 +33,7 @@ SCRIPTS_DIR = PROJECT_ROOT / "Scripts_code"
 OUTPUT_DIR = SCRIPTS_DIR / "outputs"
 
 PILOT_POOL_PATH = OUTPUT_DIR / "candidate_pool_pilot_20.csv"
+MAIN_POOL_PATH = OUTPUT_DIR / "candidate_pool_main_160.csv"
 
 CLASSIFIER_WRAPPER_PATH = SCRIPTS_DIR / "03_classifier_wrapper.py"
 VALIDITY_CHECKS_PATH = SCRIPTS_DIR / "04_validity_checks.py"
@@ -79,9 +80,30 @@ DEFAULT_LOCAL_LLM_CONTEXT_SIZE = 4096
 DEFAULT_LOCAL_LLM_GPU_LAYERS = "auto"
 DEFAULT_ALLOW_NONLOCAL_LLM_SERVER = False
 DEFAULT_LOCAL_LLM_REQUEST_TIMEOUT_SECONDS = 300.0
-LOCAL_LLM_PROMPT_VERSION = "qwen3_paraphrase_feedback_v2_conservative"
+LOCAL_LLM_PROMPT_VERSION_V2_CONSERVATIVE = "qwen3_paraphrase_feedback_v2_conservative"
+LOCAL_LLM_PROMPT_VERSION_V3_DIVERSE_CONSERVATIVE = (
+    "qwen3_paraphrase_feedback_v3_diverse_conservative"
+)
+LOCAL_LLM_PROMPT_VERSION = LOCAL_LLM_PROMPT_VERSION_V2_CONSERVATIVE
+LOCAL_LLM_PROMPT_VERSIONS = (
+    LOCAL_LLM_PROMPT_VERSION_V2_CONSERVATIVE,
+    LOCAL_LLM_PROMPT_VERSION_V3_DIVERSE_CONSERVATIVE,
+)
 
-EXPECTED_SOURCE_SPLIT = "train_dev"
+PILOT_POOL_NAME = "pilot"
+MAIN_POOL_NAME = "main"
+POOL_CONFIGS = {
+    PILOT_POOL_NAME: {
+        "path": PILOT_POOL_PATH,
+        "expected_source_split": "train_dev",
+        "expected_full_pool_size": 20,
+    },
+    MAIN_POOL_NAME: {
+        "path": MAIN_POOL_PATH,
+        "expected_source_split": "test_final",
+        "expected_full_pool_size": 160,
+    },
+}
 ATTACK_TEXT_COLUMN = "attack_text"
 ROW_ID_COLUMN = "row_id"
 GOLD_LABEL_NAME_COLUMN = "gold_label_name"
@@ -345,7 +367,7 @@ class LocalLLMParaphraser:
 Your task is to make the smallest natural rewrite possible while preserving the exact meaning and the original truthfulness/deceptiveness status.
 Output exactly one complete rewritten paragraph and nothing else."""
 
-    USER_PROMPT_TEMPLATE = """Rewrite the text below as one conservative, meaning-preserving paraphrase.
+    USER_PROMPT_TEMPLATE_V2_CONSERVATIVE = """Rewrite the text below as one conservative, meaning-preserving paraphrase.
 Make the smallest natural paraphrase possible. Do not summarize, interpret, correct, or embellish the text.
 
 Hard preservation rules:
@@ -378,6 +400,51 @@ Original text:
 
 Rewritten paragraph:"""
 
+    USER_PROMPT_TEMPLATE_V3_DIVERSE_CONSERVATIVE = """Rewrite the text below as one conservative, meaning-preserving paraphrase.
+Make a small but real paraphrase. Do not copy the original text. Do not summarize, interpret, correct, or embellish the text.
+
+Hard preservation rules:
+- Preserve the exact same meaning.
+- Preserve the original truthfulness/deceptiveness status.
+- Preserve all numbers exactly as written.
+- Preserve all dates, years, date-like strings, and time markers exactly as written.
+- Preserve names and locations exactly as written.
+- Preserve negation exactly.
+- Preserve the order of events.
+- Keep roughly the same length.
+- Do not add any details.
+- Do not remove any details.
+- Do not summarize.
+- Do not fix or normalize unusual source formatting. For example, if the source contains "2018I", keep that exact form.
+- Use natural English only where it does not change the details above.
+
+Required rewrite:
+- The output must not be identical to the original text.
+- Change wording or sentence structure in at least two small places.
+- Keep every factual detail unchanged.
+- Make only conservative edits that preserve meaning.
+
+Rewrite strategy for this attempt:
+{rewrite_strategy_block}
+
+Output rules:
+- Output one complete rewritten paragraph only.
+- No explanations.
+- No bullet points.
+- No quotes around the answer.
+- Do not write phrases like "Here is the paraphrase".
+- Do not mention the classifier, attack, labels, confidence, or feedback in the output.
+
+Feedback available:
+{feedback_block}
+
+Original text:
+{original_text}
+
+Rewritten paragraph:"""
+
+    USER_PROMPT_TEMPLATE = USER_PROMPT_TEMPLATE_V2_CONSERVATIVE
+
     LABEL_ONLY_FEEDBACK_TEMPLATE = "- Current predicted label: {predicted_label_name}"
     SCORE_BASED_FEEDBACK_TEMPLATE = (
         "- Current predicted label: {predicted_label_name}\n"
@@ -401,6 +468,7 @@ Rewritten paragraph:"""
         allow_cpu: bool = DEFAULT_ALLOW_LOCAL_LLM_CPU,
         load_in_4bit: bool = DEFAULT_LOCAL_LLM_LOAD_IN_4BIT,
         load_in_8bit: bool = DEFAULT_LOCAL_LLM_LOAD_IN_8BIT,
+        prompt_version: str = LOCAL_LLM_PROMPT_VERSION,
     ) -> None:
         self.model_id = model_id
         self.model_path = Path(model_path) if model_path is not None else None
@@ -417,7 +485,8 @@ Rewritten paragraph:"""
         self.top_k = int(top_k)
         self.repetition_penalty = float(repetition_penalty)
         self.do_sample = bool(do_sample)
-        self.prompt_version = LOCAL_LLM_PROMPT_VERSION
+        self.prompt_version = self._validate_prompt_version(prompt_version)
+        self.user_prompt_template = self._select_user_prompt_template(self.prompt_version)
         self._last_generation_runtime = GenerationRuntime()
 
         self._torch = self._import_torch()
@@ -624,6 +693,7 @@ Rewritten paragraph:"""
         messages = self._build_messages(
             original_text=normalize_text(original_text),
             feedback=feedback,
+            attempt_index=attempt_index,
         )
         prompt_text = self.tokenizer.apply_chat_template(
             messages,
@@ -687,6 +757,7 @@ Rewritten paragraph:"""
         self,
         original_text: str,
         feedback: AttackFeedback,
+        attempt_index: int,
     ) -> list[dict[str, str]]:
         if feedback.feedback_condition == LABEL_ONLY_CONDITION:
             feedback_block = self.LABEL_ONLY_FEEDBACK_TEMPLATE.format(
@@ -702,14 +773,46 @@ Rewritten paragraph:"""
         else:
             raise ValueError(f"Unknown feedback condition: {feedback.feedback_condition}")
 
-        user_prompt = self.USER_PROMPT_TEMPLATE.format(
+        user_prompt = self.user_prompt_template.format(
             feedback_block=feedback_block,
             original_text=original_text,
+            rewrite_strategy_block=LocalLLMParaphraser.rewrite_strategy_for_attempt(
+                attempt_index
+            ),
         )
         return [
             {"role": "system", "content": self.SYSTEM_PROMPT_TEMPLATE},
             {"role": "user", "content": user_prompt},
         ]
+
+    @staticmethod
+    def _validate_prompt_version(prompt_version: str) -> str:
+        normalized = str(prompt_version).strip()
+        if normalized not in LOCAL_LLM_PROMPT_VERSIONS:
+            raise ValueError(
+                f"Unknown local LLM prompt version {prompt_version!r}. "
+                f"Choose one of: {list(LOCAL_LLM_PROMPT_VERSIONS)}"
+            )
+        return normalized
+
+    @staticmethod
+    def _select_user_prompt_template(prompt_version: str) -> str:
+        if prompt_version == LOCAL_LLM_PROMPT_VERSION_V2_CONSERVATIVE:
+            return LocalLLMParaphraser.USER_PROMPT_TEMPLATE_V2_CONSERVATIVE
+        if prompt_version == LOCAL_LLM_PROMPT_VERSION_V3_DIVERSE_CONSERVATIVE:
+            return LocalLLMParaphraser.USER_PROMPT_TEMPLATE_V3_DIVERSE_CONSERVATIVE
+        raise ValueError(f"Unknown local LLM prompt version: {prompt_version}")
+
+    @staticmethod
+    def rewrite_strategy_for_attempt(attempt_index: int) -> str:
+        strategies = [
+            "Make a light syntactic rewrite while preserving all details exactly.",
+            "Change sentence openings or connective phrasing without changing the event order.",
+            "Reorder clauses only where the meaning and timeline remain unchanged.",
+            "Replace non-critical wording with close synonyms while keeping names, places, numbers, dates, and negation unchanged.",
+            "Split or merge clauses naturally while preserving every stated detail.",
+        ]
+        return strategies[(int(attempt_index) - 1) % len(strategies)]
 
     @staticmethod
     def _clean_generated_text(generated_text: str) -> str:
@@ -735,9 +838,12 @@ Rewritten paragraph:"""
         prompt_material = "\n\n".join(
             [
                 self.SYSTEM_PROMPT_TEMPLATE,
-                self.USER_PROMPT_TEMPLATE,
+                self.user_prompt_template,
                 self.LABEL_ONLY_FEEDBACK_TEMPLATE,
                 self.SCORE_BASED_FEEDBACK_TEMPLATE,
+                "\n".join(
+                    self.rewrite_strategy_for_attempt(i) for i in range(1, 6)
+                ),
             ]
         )
         prompt_hash = hashlib.sha256(prompt_material.encode("utf-8")).hexdigest()
@@ -779,9 +885,12 @@ Rewritten paragraph:"""
             "prompt_template_sha256": prompt_hash,
             "prompt_template": {
                 "system": self.SYSTEM_PROMPT_TEMPLATE,
-                "user": self.USER_PROMPT_TEMPLATE,
+                "user": self.user_prompt_template,
                 "label_only_feedback_block": self.LABEL_ONLY_FEEDBACK_TEMPLATE,
                 "score_based_feedback_block": self.SCORE_BASED_FEEDBACK_TEMPLATE,
+                "rewrite_strategies": [
+                    self.rewrite_strategy_for_attempt(i) for i in range(1, 6)
+                ],
             },
             "transformers_version": self.transformers_version,
             "torch_version": self.torch_version,
@@ -805,6 +914,12 @@ class LlamaCppServerLocalLLMParaphraser:
 
     SYSTEM_PROMPT_TEMPLATE = LocalLLMParaphraser.SYSTEM_PROMPT_TEMPLATE
     USER_PROMPT_TEMPLATE = LocalLLMParaphraser.USER_PROMPT_TEMPLATE
+    USER_PROMPT_TEMPLATE_V2_CONSERVATIVE = (
+        LocalLLMParaphraser.USER_PROMPT_TEMPLATE_V2_CONSERVATIVE
+    )
+    USER_PROMPT_TEMPLATE_V3_DIVERSE_CONSERVATIVE = (
+        LocalLLMParaphraser.USER_PROMPT_TEMPLATE_V3_DIVERSE_CONSERVATIVE
+    )
     LABEL_ONLY_FEEDBACK_TEMPLATE = LocalLLMParaphraser.LABEL_ONLY_FEEDBACK_TEMPLATE
     SCORE_BASED_FEEDBACK_TEMPLATE = LocalLLMParaphraser.SCORE_BASED_FEEDBACK_TEMPLATE
 
@@ -825,6 +940,7 @@ class LlamaCppServerLocalLLMParaphraser:
         gpu_layers: str = DEFAULT_LOCAL_LLM_GPU_LAYERS,
         allow_nonlocal_server: bool = DEFAULT_ALLOW_NONLOCAL_LLM_SERVER,
         request_timeout_seconds: float = DEFAULT_LOCAL_LLM_REQUEST_TIMEOUT_SECONDS,
+        prompt_version: str = LOCAL_LLM_PROMPT_VERSION,
     ) -> None:
         self.model_id = model_id
         self.backend = LOCAL_LLM_LLAMA_CPP_SERVER_BACKEND
@@ -843,7 +959,12 @@ class LlamaCppServerLocalLLMParaphraser:
         self.gpu_layers = str(gpu_layers)
         self.allow_nonlocal_server = bool(allow_nonlocal_server)
         self.request_timeout_seconds = float(request_timeout_seconds)
-        self.prompt_version = LOCAL_LLM_PROMPT_VERSION
+        self.prompt_version = LocalLLMParaphraser._validate_prompt_version(
+            prompt_version
+        )
+        self.user_prompt_template = LocalLLMParaphraser._select_user_prompt_template(
+            self.prompt_version
+        )
         self._last_generation_runtime = GenerationRuntime()
 
         self._validate_local_server_url()
@@ -985,6 +1106,7 @@ class LlamaCppServerLocalLLMParaphraser:
         messages = self._build_messages(
             original_text=normalize_text(original_text),
             feedback=feedback,
+            attempt_index=attempt_index,
         )
         payload: dict[str, object] = {
             "model": self.server_model,
@@ -1070,11 +1192,13 @@ class LlamaCppServerLocalLLMParaphraser:
         self,
         original_text: str,
         feedback: AttackFeedback,
+        attempt_index: int,
     ) -> list[dict[str, str]]:
         return LocalLLMParaphraser._build_messages(
             self,
             original_text=original_text,
             feedback=feedback,
+            attempt_index=attempt_index,
         )
 
     def _gguf_metadata(self) -> dict[str, object]:
@@ -1108,9 +1232,13 @@ class LlamaCppServerLocalLLMParaphraser:
         prompt_material = "\n\n".join(
             [
                 self.SYSTEM_PROMPT_TEMPLATE,
-                self.USER_PROMPT_TEMPLATE,
+                self.user_prompt_template,
                 self.LABEL_ONLY_FEEDBACK_TEMPLATE,
                 self.SCORE_BASED_FEEDBACK_TEMPLATE,
+                "\n".join(
+                    LocalLLMParaphraser.rewrite_strategy_for_attempt(i)
+                    for i in range(1, 6)
+                ),
             ]
         )
         prompt_hash = hashlib.sha256(prompt_material.encode("utf-8")).hexdigest()
@@ -1156,9 +1284,13 @@ class LlamaCppServerLocalLLMParaphraser:
             "prompt_template_sha256": prompt_hash,
             "prompt_template": {
                 "system": self.SYSTEM_PROMPT_TEMPLATE,
-                "user": self.USER_PROMPT_TEMPLATE,
+                "user": self.user_prompt_template,
                 "label_only_feedback_block": self.LABEL_ONLY_FEEDBACK_TEMPLATE,
                 "score_based_feedback_block": self.SCORE_BASED_FEEDBACK_TEMPLATE,
+                "rewrite_strategies": [
+                    LocalLLMParaphraser.rewrite_strategy_for_attempt(i)
+                    for i in range(1, 6)
+                ],
             },
             "description": (
                 "Fixed Qwen local paraphraser using a local llama.cpp "
@@ -1195,6 +1327,7 @@ def build_paraphraser(args: argparse.Namespace) -> Paraphraser:
                 gpu_layers=args.local_llm_gpu_layers,
                 allow_nonlocal_server=args.allow_nonlocal_llm_server,
                 request_timeout_seconds=args.local_llm_request_timeout_seconds,
+                prompt_version=args.local_llm_prompt_version,
             )
         return LocalLLMParaphraser(
             model_id=args.local_llm_model_id,
@@ -1214,6 +1347,7 @@ def build_paraphraser(args: argparse.Namespace) -> Paraphraser:
             allow_cpu=args.allow_local_llm_cpu,
             load_in_4bit=args.local_llm_load_in_4bit,
             load_in_8bit=args.local_llm_load_in_8bit,
+            prompt_version=args.local_llm_prompt_version,
         )
     raise ValueError(f"Unknown paraphraser mode: {mode}")
 
@@ -1276,6 +1410,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=MAX_GENERATION_ATTEMPTS,
         help="Maximum paraphrase generation attempts per row and feedback condition.",
+    )
+    parser.add_argument(
+        "--pool",
+        default=PILOT_POOL_NAME,
+        choices=[PILOT_POOL_NAME, MAIN_POOL_NAME],
+        help=(
+            "Candidate pool to attack. pilot preserves the previous train-dev "
+            "pilot behavior; main uses the frozen 160-row final-test pool."
+        ),
+    )
+    parser.add_argument(
+        "--output-tag",
+        default=None,
+        help=(
+            "Optional safe suffix for output files, e.g. gen6_query3. "
+            "When omitted, preserves the original filenames."
+        ),
     )
     parser.add_argument(
         "--local-llm-model-id",
@@ -1430,6 +1581,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LOCAL_LLM_REQUEST_TIMEOUT_SECONDS,
         help="HTTP timeout for each llama_cpp_server generation request.",
     )
+    parser.add_argument(
+        "--local-llm-prompt-version",
+        default=LOCAL_LLM_PROMPT_VERSION,
+        choices=list(LOCAL_LLM_PROMPT_VERSIONS),
+        help=(
+            "Prompt template version for local_llm. The v2 default preserves "
+            "previous behavior; v3 adds conservative non-identical rewrite "
+            "instructions and attempt-specific strategies."
+        ),
+    )
     args = parser.parse_args()
     validate_args(args)
     return args
@@ -1458,6 +1619,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--local-llm-context-size must be positive.")
     if args.local_llm_request_timeout_seconds <= 0:
         raise ValueError("--local-llm-request-timeout-seconds must be positive.")
+    if args.output_tag is not None:
+        normalized_tag = str(args.output_tag).strip()
+        if not normalized_tag:
+            raise ValueError("--output-tag must not be empty when provided.")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", normalized_tag):
+            raise ValueError(
+                "--output-tag may contain only letters, numbers, underscore, dash, and dot."
+            )
+        args.output_tag = normalized_tag
 
 
 def configure_logging(level: str) -> None:
@@ -1609,6 +1779,7 @@ def collect_runtime_info(args: argparse.Namespace) -> dict[str, object]:
             args.local_llm_gguf_model_path
             and Path(args.local_llm_gguf_model_path).exists()
         ),
+        "local_llm_prompt_version": args.local_llm_prompt_version,
         "local_files_only": args.local_llm_local_files_only,
         "allow_local_llm_cpu": args.allow_local_llm_cpu,
     }
@@ -1628,6 +1799,11 @@ def normalize_text(text: str) -> str:
     return " ".join(str(text).split()).strip()
 
 
+def canonicalize_for_candidate_identity(text: str) -> str:
+    normalized = normalize_text(text).lower()
+    return normalized
+
+
 def compute_file_hash(path: Path) -> str:
     hasher = hashlib.sha256()
     with open(path, "rb") as f:
@@ -1636,11 +1812,19 @@ def compute_file_hash(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def build_output_paths(paraphraser_mode: str) -> OutputPaths:
+def build_output_paths(
+    experiment_split: str,
+    paraphraser_mode: str,
+    output_tag: str | None = None,
+) -> OutputPaths:
+    suffix = f"_{output_tag}" if output_tag else ""
     return OutputPaths(
-        attempts=OUTPUT_DIR / f"attack_attempts_pilot_{paraphraser_mode}.csv",
-        results=OUTPUT_DIR / f"attack_results_pilot_{paraphraser_mode}.csv",
-        metadata=OUTPUT_DIR / f"attack_pilot_meta_{paraphraser_mode}.json",
+        attempts=OUTPUT_DIR
+        / f"attack_attempts_{experiment_split}_{paraphraser_mode}{suffix}.csv",
+        results=OUTPUT_DIR
+        / f"attack_results_{experiment_split}_{paraphraser_mode}{suffix}.csv",
+        metadata=OUTPUT_DIR
+        / f"attack_{experiment_split}_meta_{paraphraser_mode}{suffix}.json",
     )
 
 
@@ -1663,7 +1847,17 @@ def check_output_paths(output_paths: OutputPaths, overwrite: bool) -> None:
         )
 
 
-def validate_pilot_pool(df: pd.DataFrame) -> None:
+def pool_config(experiment_split: str) -> dict[str, object]:
+    if experiment_split not in POOL_CONFIGS:
+        raise ValueError(
+            f"Unknown pool {experiment_split!r}; choose one of {sorted(POOL_CONFIGS)}."
+        )
+    return POOL_CONFIGS[experiment_split]
+
+
+def validate_attack_pool(df: pd.DataFrame, experiment_split: str, pool_path: Path) -> None:
+    config = pool_config(experiment_split)
+    expected_source_split = str(config["expected_source_split"])
     required_columns = {
         SOURCE_SPLIT_COLUMN,
         SOURCE_TEXT_COLUMN,
@@ -1675,16 +1869,17 @@ def validate_pilot_pool(df: pd.DataFrame) -> None:
     missing = required_columns - set(df.columns)
     if missing:
         raise ValueError(
-            f"{PILOT_POOL_PATH.name} is missing required columns: {sorted(missing)}"
+            f"{pool_path.name} is missing required columns: {sorted(missing)}"
         )
 
     if df.empty:
-        raise ValueError(f"{PILOT_POOL_PATH.name} is empty.")
+        raise ValueError(f"{pool_path.name} is empty.")
 
     splits = set(df[SOURCE_SPLIT_COLUMN].astype(str).str.strip().unique())
-    if splits != {EXPECTED_SOURCE_SPLIT}:
+    if splits != {expected_source_split}:
         raise ValueError(
-            f"Pilot attack must use only {EXPECTED_SOURCE_SPLIT!r}; found {sorted(splits)}."
+            f"{experiment_split} attack must use only {expected_source_split!r}; "
+            f"found {sorted(splits)}."
         )
 
     text_columns = set(df[SOURCE_TEXT_COLUMN].astype(str).str.strip().unique())
@@ -1704,19 +1899,21 @@ def validate_pilot_pool(df: pd.DataFrame) -> None:
         df[ATTACK_TEXT_COLUMN].fillna("").astype(str).str.strip().eq("").sum()
     )
     if empty_texts:
-        raise ValueError(f"Pilot pool contains {empty_texts} empty attack texts.")
+        raise ValueError(f"{pool_path.name} contains {empty_texts} empty attack texts.")
 
 
-def load_pilot_pool() -> pd.DataFrame:
-    if not PILOT_POOL_PATH.exists():
+def load_attack_pool(experiment_split: str) -> tuple[pd.DataFrame, Path]:
+    config = pool_config(experiment_split)
+    pool_path = Path(config["path"])
+    if not pool_path.exists():
         raise FileNotFoundError(
-            f"Missing pilot candidate pool: {PILOT_POOL_PATH}. "
+            f"Missing {experiment_split} candidate pool: {pool_path}. "
             "Run Scripts_code/02_make_attack_pool.py first."
         )
 
-    df = pd.read_csv(PILOT_POOL_PATH)
-    validate_pilot_pool(df)
-    return df.sort_values(ROW_ID_COLUMN).reset_index(drop=True)
+    df = pd.read_csv(pool_path)
+    validate_attack_pool(df, experiment_split=experiment_split, pool_path=pool_path)
+    return df.sort_values(ROW_ID_COLUMN).reset_index(drop=True), pool_path
 
 
 def failed_checks_to_json(failed_checks: list[str]) -> str:
@@ -1827,6 +2024,8 @@ def run_single_attack(
     stop_reason = "not_started"
     valid_candidates = 0
     invalid_candidates = 0
+    original_identity_key = canonicalize_for_candidate_identity(original_text)
+    seen_non_original_candidate_keys: set[str] = set()
 
     for attempt_index in range(1, max_generation_attempts + 1):
         if queries_used >= max_classifier_queries:
@@ -1841,11 +2040,23 @@ def run_single_attack(
             row_id=row_id,
         )
         generation_runtime = paraphraser.get_last_generation_runtime()
+        candidate_identity_key = canonicalize_for_candidate_identity(candidate_text)
+        is_duplicate_candidate = (
+            candidate_identity_key != original_identity_key
+            and candidate_identity_key in seen_non_original_candidate_keys
+        )
+        if is_duplicate_candidate:
+            is_valid = False
+            failed_checks = ["duplicate_candidate"]
+            semantic_similarity = None
+        else:
+            if candidate_identity_key != original_identity_key:
+                seen_non_original_candidate_keys.add(candidate_identity_key)
+            validity = validity_checker.evaluate(original_text, candidate_text)
+            is_valid = bool(validity.is_valid)
+            failed_checks = list(validity.failed_checks)
+            semantic_similarity = validity.semantic_similarity
 
-        validity = validity_checker.evaluate(original_text, candidate_text)
-        is_valid = bool(validity.is_valid)
-        failed_checks = list(validity.failed_checks)
-        semantic_similarity = validity.semantic_similarity
         if is_valid:
             valid_candidates += 1
         else:
@@ -1866,6 +2077,14 @@ def run_single_attack(
             ),
             generation_runtime.generated_token_count,
         )
+        if is_duplicate_candidate:
+            logging.info(
+                "Duplicate candidate rejected before classifier query | row_id=%s | "
+                "condition=%s | attempt=%s",
+                row_id,
+                feedback_condition,
+                attempt_index,
+            )
 
         queried_classifier = False
         classifier_query_index: int | None = None
@@ -2047,12 +2266,15 @@ def as_bool_series(series: pd.Series) -> pd.Series:
 def run_post_run_integrity_checks(
     attempts_path: Path,
     results_path: Path,
-    pilot_df: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    experiment_split: str,
     max_classifier_queries: int,
-    require_full_pilot_size: bool,
+    require_full_pool_size: bool,
 ) -> None:
     attempts_df = pd.read_csv(attempts_path)
     results_df = pd.read_csv(results_path)
+    config = pool_config(experiment_split)
+    expected_full_pool_size = int(config["expected_full_pool_size"])
 
     allowed_stop_reasons = {
         "success",
@@ -2062,16 +2284,19 @@ def run_post_run_integrity_checks(
     }
     errors: list[str] = []
 
-    expected_result_rows = len(pilot_df) * len(FEEDBACK_CONDITIONS)
-    if require_full_pilot_size and len(pilot_df) != 20:
-        errors.append(f"Pilot pool has {len(pilot_df)} rows, expected 20.")
+    expected_result_rows = len(pool_df) * len(FEEDBACK_CONDITIONS)
+    if require_full_pool_size and len(pool_df) != expected_full_pool_size:
+        errors.append(
+            f"{experiment_split} pool has {len(pool_df)} rows, "
+            f"expected {expected_full_pool_size}."
+        )
     if len(results_df) != expected_result_rows:
         errors.append(
             f"Results file has {len(results_df)} rows, expected {expected_result_rows}."
         )
 
-    pilot_row_ids = set(pilot_df[ROW_ID_COLUMN].astype(int).tolist())
-    for row_id in sorted(pilot_row_ids):
+    pool_row_ids = set(pool_df[ROW_ID_COLUMN].astype(int).tolist())
+    for row_id in sorted(pool_row_ids):
         row_results = results_df[results_df["row_id"].astype(int) == row_id]
         condition_counts = row_results["feedback_condition"].value_counts().to_dict()
         for condition in FEEDBACK_CONDITIONS:
@@ -2081,10 +2306,20 @@ def run_post_run_integrity_checks(
                     f"{condition} result rows, expected 1."
                 )
 
-    unexpected_result_rows = set(results_df["row_id"].astype(int)) - pilot_row_ids
+    unexpected_result_rows = set(results_df["row_id"].astype(int)) - pool_row_ids
     if unexpected_result_rows:
         errors.append(
-            f"Results include row_ids outside the pilot pool: {sorted(unexpected_result_rows)}."
+            f"Results include row_ids outside the {experiment_split} pool: "
+            f"{sorted(unexpected_result_rows)}."
+        )
+
+    original_mismatches = results_df[
+        results_df["stop_reason"].astype(str) == "original_prediction_mismatch"
+    ]
+    if not original_mismatches.empty:
+        errors.append(
+            "Verified original predictions were not correct for rows: "
+            f"{original_mismatches[['row_id', 'feedback_condition', 'gold_label_name', 'original_pred_label_name']].to_dict('records')}"
         )
 
     query_counts = pd.to_numeric(results_df["queries_used"], errors="coerce")
@@ -2116,6 +2351,17 @@ def run_post_run_integrity_checks(
             errors.append(
                 "Invalid candidates were queried for rows: "
                 f"{invalid_queried[['row_id', 'feedback_condition', 'attempt_index']].to_dict('records')}"
+            )
+
+        duplicate_candidate = attempts_df["failed_checks"].fillna("").astype(str).str.contains(
+            "duplicate_candidate",
+            regex=False,
+        )
+        duplicate_queried = attempts_df[duplicate_candidate & queried_classifier]
+        if not duplicate_queried.empty:
+            errors.append(
+                "Duplicate candidates were queried for rows: "
+                f"{duplicate_queried[['row_id', 'feedback_condition', 'attempt_index']].to_dict('records')}"
             )
 
         has_query_index = classifier_query_index.notna()
@@ -2172,7 +2418,9 @@ def run_post_run_integrity_checks(
 
 def build_metadata(
     run_id: str,
-    pilot_df: pd.DataFrame,
+    pool_df: pd.DataFrame,
+    experiment_split: str,
+    pool_path: Path,
     classifier: Any,
     validity_checker: Any,
     attempts_df: pd.DataFrame,
@@ -2185,6 +2433,7 @@ def build_metadata(
     max_classifier_queries: int,
     max_generation_attempts: int,
     max_examples: int | None,
+    output_tag: str | None,
 ) -> dict[str, object]:
     if not attempts_df.empty and "generation_seconds" in attempts_df.columns:
         generation_seconds = pd.to_numeric(
@@ -2204,36 +2453,49 @@ def build_metadata(
         generated_tokens = pd.Series(dtype="float64")
         tokens_per_second = pd.Series(dtype="float64")
 
+    paraphraser_metadata = paraphraser.get_metadata() | {
+        "mode": paraphraser_mode,
+        "name": type(paraphraser).__name__,
+    }
+
     return {
         "run_id": run_id,
         "run_name": RUN_NAME,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "seed": seed,
+        "experiment_split": experiment_split,
+        "output_tag": output_tag,
         "input_pool": {
-            "path": str(PILOT_POOL_PATH),
-            "sha256": compute_file_hash(PILOT_POOL_PATH),
-            "num_rows": int(len(pilot_df)),
+            "path": str(pool_path),
+            "sha256": compute_file_hash(pool_path),
+            "num_rows": int(len(pool_df)),
             "row_limit": max_examples,
             "source_splits": sorted(
-                set(pilot_df[SOURCE_SPLIT_COLUMN].astype(str).str.strip())
+                set(pool_df[SOURCE_SPLIT_COLUMN].astype(str).str.strip())
             ),
             "source_text_columns": sorted(
-                set(pilot_df[SOURCE_TEXT_COLUMN].astype(str).str.strip())
+                set(pool_df[SOURCE_TEXT_COLUMN].astype(str).str.strip())
             ),
         },
         "feedback_conditions": list(FEEDBACK_CONDITIONS),
         "budgets": {
             "max_classifier_queries": max_classifier_queries,
             "max_generation_attempts": max_generation_attempts,
+            "budget_config": (
+                f"gen{max_generation_attempts}_query{max_classifier_queries}"
+            ),
             "invalid_paraphrases_count_as_classifier_queries": False,
             "original_prediction_verification_counts_against_attack_budget": False,
+            "duplicate_candidates_count_as_classifier_queries": False,
         },
+        "budget_config": f"gen{max_generation_attempts}_query{max_classifier_queries}",
         "success_definition": (
             "valid paraphrase + classifier prediction flip from the verified "
             "original prediction + within classifier-query budget"
         ),
-        "paraphraser": paraphraser.get_metadata()
-        | {"mode": paraphraser_mode, "name": type(paraphraser).__name__},
+        "prompt_version": paraphraser_metadata.get("prompt_version"),
+        "prompt_template_sha256": paraphraser_metadata.get("prompt_template_sha256"),
+        "paraphraser": paraphraser_metadata,
         "integrity_checks_passed": integrity_checks_passed,
         "classifier": classifier.get_metadata(),
         "validity_checker": validity_checker.get_metadata(),
@@ -2288,19 +2550,28 @@ def main() -> None:
         print_runtime_info(args)
         return
 
-    output_paths = build_output_paths(args.paraphraser)
+    output_paths = build_output_paths(args.pool, args.paraphraser, args.output_tag)
     check_output_paths(output_paths=output_paths, overwrite=args.overwrite)
 
-    run_id = datetime.now(timezone.utc).strftime("pilot_%Y%m%dT%H%M%SZ")
-    logging.info("Starting pilot attack run | run_id=%s", run_id)
+    run_id = datetime.now(timezone.utc).strftime(f"{args.pool}_%Y%m%dT%H%M%SZ")
+    logging.info("Starting %s attack run | run_id=%s", args.pool, run_id)
     paraphraser = build_paraphraser(args)
     logging.info("Using paraphraser mode: %s", args.paraphraser)
 
-    pilot_df = load_pilot_pool()
+    pool_df, pool_path = load_attack_pool(args.pool)
     if args.max_examples is not None:
-        pilot_df = pilot_df.head(args.max_examples).reset_index(drop=True)
-        logging.info("Applying pilot row limit | max_examples=%s", args.max_examples)
-    logging.info("Loaded pilot pool | path=%s | rows=%s", PILOT_POOL_PATH, len(pilot_df))
+        pool_df = pool_df.head(args.max_examples).reset_index(drop=True)
+        logging.info(
+            "Applying %s row limit | max_examples=%s",
+            args.pool,
+            args.max_examples,
+        )
+    logging.info(
+        "Loaded %s pool | path=%s | rows=%s",
+        args.pool,
+        pool_path,
+        len(pool_df),
+    )
 
     logging.info("Loading classifier wrapper.")
     classifier = DeceptionClassifierWrapper()
@@ -2309,7 +2580,7 @@ def main() -> None:
     validity_checker = ParaphraseValidityChecker()
 
     attempts_df, results_df = run_pilot_attack(
-        pilot_df=pilot_df,
+        pilot_df=pool_df,
         run_id=run_id,
         classifier=classifier,
         validity_checker=validity_checker,
@@ -2324,14 +2595,17 @@ def main() -> None:
     run_post_run_integrity_checks(
         attempts_path=output_paths.attempts,
         results_path=output_paths.results,
-        pilot_df=pilot_df,
+        pool_df=pool_df,
+        experiment_split=args.pool,
         max_classifier_queries=args.max_classifier_queries,
-        require_full_pilot_size=args.max_examples is None,
+        require_full_pool_size=args.max_examples is None,
     )
 
     metadata = build_metadata(
         run_id=run_id,
-        pilot_df=pilot_df,
+        pool_df=pool_df,
+        experiment_split=args.pool,
+        pool_path=pool_path,
         classifier=classifier,
         validity_checker=validity_checker,
         attempts_df=attempts_df,
@@ -2344,11 +2618,12 @@ def main() -> None:
         max_classifier_queries=args.max_classifier_queries,
         max_generation_attempts=args.max_generation_attempts,
         max_examples=args.max_examples,
+        output_tag=args.output_tag,
     )
     with open(output_paths.metadata, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    logging.info("Pilot attack complete.")
+    logging.info("%s attack complete.", args.pool.capitalize())
     logging.info("Attempts saved to: %s", output_paths.attempts)
     logging.info("Results saved to:  %s", output_paths.results)
     logging.info("Metadata saved to: %s", output_paths.metadata)
