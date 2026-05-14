@@ -34,6 +34,7 @@ OUTPUT_DIR = SCRIPTS_DIR / "outputs"
 
 PILOT_POOL_PATH = OUTPUT_DIR / "candidate_pool_pilot_20.csv"
 MAIN_POOL_PATH = OUTPUT_DIR / "candidate_pool_main_160.csv"
+EXPLORATORY_POOL_PATH = OUTPUT_DIR / "candidate_pool_exploratory_remaining.csv"
 
 CLASSIFIER_WRAPPER_PATH = SCRIPTS_DIR / "03_classifier_wrapper.py"
 VALIDITY_CHECKS_PATH = SCRIPTS_DIR / "04_validity_checks.py"
@@ -92,6 +93,7 @@ LOCAL_LLM_PROMPT_VERSIONS = (
 
 PILOT_POOL_NAME = "pilot"
 MAIN_POOL_NAME = "main"
+EXPLORATORY_POOL_NAME = "exploratory"
 POOL_CONFIGS = {
     PILOT_POOL_NAME: {
         "path": PILOT_POOL_PATH,
@@ -102,6 +104,11 @@ POOL_CONFIGS = {
         "path": MAIN_POOL_PATH,
         "expected_source_split": "test_final",
         "expected_full_pool_size": 160,
+    },
+    EXPLORATORY_POOL_NAME: {
+        "path": EXPLORATORY_POOL_PATH,
+        "expected_source_split": "test_final",
+        "expected_full_pool_size": 229,
     },
 }
 ATTACK_TEXT_COLUMN = "attack_text"
@@ -1414,10 +1421,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pool",
         default=PILOT_POOL_NAME,
-        choices=[PILOT_POOL_NAME, MAIN_POOL_NAME],
+        choices=[PILOT_POOL_NAME, MAIN_POOL_NAME, EXPLORATORY_POOL_NAME],
         help=(
             "Candidate pool to attack. pilot preserves the previous train-dev "
-            "pilot behavior; main uses the frozen 160-row final-test pool."
+            "pilot behavior; main uses the frozen 160-row final-test pool; "
+            "exploratory uses the held-out final-test remainder."
         ),
     )
     parser.add_argument(
@@ -1885,14 +1893,14 @@ def validate_attack_pool(df: pd.DataFrame, experiment_split: str, pool_path: Pat
     text_columns = set(df[SOURCE_TEXT_COLUMN].astype(str).str.strip().unique())
     if text_columns != {"text_truncated"}:
         raise ValueError(
-            "Pilot pool must use text_truncated as the attacked text column; "
+            f"{experiment_split} pool must use text_truncated as the attacked text column; "
             f"found {sorted(text_columns)}."
         )
 
     if not df[CORRECT_COLUMN].isin([1, True]).all():
         bad = int((~df[CORRECT_COLUMN].isin([1, True])).sum())
         raise ValueError(
-            f"Pilot pool contains {bad} rows that were not originally correct."
+            f"{experiment_split} pool contains {bad} rows that were not originally correct."
         )
 
     empty_texts = int(

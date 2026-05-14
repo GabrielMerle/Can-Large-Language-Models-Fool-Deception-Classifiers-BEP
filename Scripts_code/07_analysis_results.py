@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-"""Analyze the frozen final main attack outputs.
+"""Analyze frozen attack outputs without touching raw experiment files.
 
 This script is intentionally read-only with respect to the raw experiment files.
 It never calls the paraphraser, classifier, or LLM server. All derived outputs are
-written under Scripts_code/outputs/analysis_main_gen3_query3/.
+written under a separate analysis directory for the selected experiment.
 """
 
+import argparse
 import json
 import math
 from collections import Counter
@@ -18,8 +19,11 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "Scripts_code" / "outputs"
-ANALYSIS_DIR = OUTPUT_DIR / "analysis_main_gen3_query3"
+MAIN_ANALYSIS_NAME = "main_gen3_query3"
+EXPLORATORY_ANALYSIS_NAME = "exploratory_remaining_gen3_query3"
 
+ANALYSIS_NAME = MAIN_ANALYSIS_NAME
+ANALYSIS_DIR = OUTPUT_DIR / "analysis_main_gen3_query3"
 RESULTS_PATH = OUTPUT_DIR / "attack_results_main_local_llm_main_gen3_query3.csv"
 ATTEMPTS_PATH = OUTPUT_DIR / "attack_attempts_main_local_llm_main_gen3_query3.csv"
 META_PATH = OUTPUT_DIR / "attack_main_meta_local_llm_main_gen3_query3.json"
@@ -31,6 +35,71 @@ EXPECTED_SPLIT = "main"
 EXPECTED_INPUT_POOL_ROWS = 160
 EXPECTED_BUDGET_CONFIG = "gen3_query3"
 EXPECTED_PROMPT_VERSION = "qwen3_paraphrase_feedback_v3_diverse_conservative"
+
+ANALYSIS_CONFIGS = {
+    MAIN_ANALYSIS_NAME: {
+        "analysis_dir": OUTPUT_DIR / "analysis_main_gen3_query3",
+        "results_path": OUTPUT_DIR / "attack_results_main_local_llm_main_gen3_query3.csv",
+        "attempts_path": OUTPUT_DIR / "attack_attempts_main_local_llm_main_gen3_query3.csv",
+        "meta_path": OUTPUT_DIR / "attack_main_meta_local_llm_main_gen3_query3.json",
+        "expected_result_rows": 320,
+        "expected_unique_row_ids": 160,
+        "expected_split": "main",
+        "expected_input_pool_rows": 160,
+        "expected_budget_config": "gen3_query3",
+        "expected_prompt_version": EXPECTED_PROMPT_VERSION,
+    },
+    EXPLORATORY_ANALYSIS_NAME: {
+        "analysis_dir": OUTPUT_DIR / "analysis_exploratory_remaining_gen3_query3",
+        "results_path": OUTPUT_DIR
+        / "attack_results_exploratory_local_llm_remaining_gen3_query3.csv",
+        "attempts_path": OUTPUT_DIR
+        / "attack_attempts_exploratory_local_llm_remaining_gen3_query3.csv",
+        "meta_path": OUTPUT_DIR
+        / "attack_exploratory_meta_local_llm_remaining_gen3_query3.json",
+        "expected_result_rows": 458,
+        "expected_unique_row_ids": 229,
+        "expected_split": "exploratory",
+        "expected_input_pool_rows": 229,
+        "expected_budget_config": "gen3_query3",
+        "expected_prompt_version": EXPECTED_PROMPT_VERSION,
+    },
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Analyze a frozen BEP attack result set into derived tables."
+    )
+    parser.add_argument(
+        "--analysis",
+        default=MAIN_ANALYSIS_NAME,
+        choices=list(ANALYSIS_CONFIGS),
+        help=(
+            "Which result set to analyze. The default preserves the primary "
+            "main analysis behavior; exploratory_remaining_gen3_query3 writes "
+            "to its own separate folder."
+        ),
+    )
+    return parser.parse_args()
+
+
+def configure_analysis(analysis_name: str) -> None:
+    config = ANALYSIS_CONFIGS[analysis_name]
+    globals_to_update = {
+        "ANALYSIS_NAME": analysis_name,
+        "ANALYSIS_DIR": config["analysis_dir"],
+        "RESULTS_PATH": config["results_path"],
+        "ATTEMPTS_PATH": config["attempts_path"],
+        "META_PATH": config["meta_path"],
+        "EXPECTED_RESULT_ROWS": config["expected_result_rows"],
+        "EXPECTED_UNIQUE_ROW_IDS": config["expected_unique_row_ids"],
+        "EXPECTED_SPLIT": config["expected_split"],
+        "EXPECTED_INPUT_POOL_ROWS": config["expected_input_pool_rows"],
+        "EXPECTED_BUDGET_CONFIG": config["expected_budget_config"],
+        "EXPECTED_PROMPT_VERSION": config["expected_prompt_version"],
+    }
+    globals().update(globals_to_update)
 
 
 def to_builtin(value: Any) -> Any:
@@ -109,12 +178,14 @@ def validate_inputs(results: pd.DataFrame, attempts: pd.DataFrame, meta: dict[st
     )
 
     checks = {
-        "results_rows_is_320": len(results) == EXPECTED_RESULT_ROWS,
-        "unique_row_ids_is_160": results["row_id"].nunique() == EXPECTED_UNIQUE_ROW_IDS,
+        f"results_rows_is_{EXPECTED_RESULT_ROWS}": len(results) == EXPECTED_RESULT_ROWS,
+        f"unique_row_ids_is_{EXPECTED_UNIQUE_ROW_IDS}": results["row_id"].nunique()
+        == EXPECTED_UNIQUE_ROW_IDS,
         "each_row_id_has_label_only_and_score_based_once": paired_condition_ok,
         "metadata_integrity_checks_passed_is_true": meta.get("integrity_checks_passed") is True,
-        "metadata_experiment_split_is_main": meta.get("experiment_split") == EXPECTED_SPLIT,
-        "metadata_input_pool_num_rows_is_160": meta.get("input_pool", {}).get("num_rows")
+        f"metadata_experiment_split_is_{EXPECTED_SPLIT}": meta.get("experiment_split")
+        == EXPECTED_SPLIT,
+        f"metadata_input_pool_num_rows_is_{EXPECTED_INPUT_POOL_ROWS}": meta.get("input_pool", {}).get("num_rows")
         == EXPECTED_INPUT_POOL_ROWS,
         "metadata_budget_config_is_gen3_query3": meta.get("budget_config") == EXPECTED_BUDGET_CONFIG,
         "metadata_prompt_version_matches_expected": meta.get("prompt_version")
@@ -518,7 +589,7 @@ def build_summary_json(
         headline = "Score-based and label-only feedback had the same ASR."
 
     return {
-        "analysis_name": "main_gen3_query3",
+        "analysis_name": ANALYSIS_NAME,
         "created_by_script": str(Path(__file__).name),
         "raw_inputs": {
             "results_path": str(RESULTS_PATH),
@@ -583,9 +654,9 @@ def print_console_summary(tables: dict[str, pd.DataFrame], summary: dict[str, An
         & (failed["count_type"] == "individual_check")
     ].head(5)
 
-    print("\n=== Final main analysis summary: main_gen3_query3 ===")
+    print(f"\n=== Analysis summary: {ANALYSIS_NAME} ===")
     print(
-        "Primary ASR: "
+        "ASR: "
         f"label_only {int(asr.loc['label_only', 'successes'])}/{int(asr.loc['label_only', 'total'])} "
         f"({asr.loc['label_only', 'percentage']:.2f}%), "
         f"score_based {int(asr.loc['score_based', 'successes'])}/{int(asr.loc['score_based', 'total'])} "
@@ -623,11 +694,14 @@ def print_console_summary(tables: dict[str, pd.DataFrame], summary: dict[str, An
         print(f"Top failed checks: {failed_text}.")
     else:
         print("Top failed checks: none recorded.")
-    print("Main interpretation:", summary["interpretation"])
+    print("Interpretation:", summary["interpretation"])
     print(f"Saved analysis outputs to: {ANALYSIS_DIR}")
 
 
 def main() -> None:
+    args = parse_args()
+    configure_analysis(args.analysis)
+
     results, attempts, meta = read_inputs()
     integrity_checks = validate_inputs(results, attempts, meta)
 
@@ -676,7 +750,7 @@ def main() -> None:
     save_csv(successes, ANALYSIS_DIR / "representative_successes.csv")
     save_csv(failures, ANALYSIS_DIR / "representative_failures.csv")
 
-    with (ANALYSIS_DIR / "summary_main_gen3_query3.json").open("w", encoding="utf-8") as f:
+    with (ANALYSIS_DIR / f"summary_{ANALYSIS_NAME}.json").open("w", encoding="utf-8") as f:
         json.dump(to_builtin(summary), f, indent=2)
         f.write("\n")
 
