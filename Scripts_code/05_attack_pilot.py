@@ -170,6 +170,12 @@ ATTEMPT_COLUMNS = [
     "total_tokens",
     "raw_usage_json",
 ]
+OPTIONAL_RESUME_ATTEMPT_COLUMNS = {
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "raw_usage_json",
+}
 
 RESULT_COLUMNS = [
     "run_id",
@@ -1648,10 +1654,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the first pilot paraphrase attack loop."
     )
-    parser.add_argument(
+    output_mode_group = parser.add_mutually_exclusive_group()
+    output_mode_group.add_argument(
         "--overwrite",
         action="store_true",
         help="Allow replacing existing pilot attack outputs.",
+    )
+    output_mode_group.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume existing outputs by skipping completed row/condition pairs. "
+            "Incomplete pairs are rerun from scratch."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -2189,7 +2204,11 @@ def build_output_paths(
     )
 
 
-def check_output_paths(output_paths: OutputPaths, overwrite: bool) -> None:
+def check_output_paths(
+    output_paths: OutputPaths,
+    overwrite: bool,
+    resume: bool = False,
+) -> None:
     existing = [
         path
         for path in [
@@ -2199,13 +2218,133 @@ def check_output_paths(output_paths: OutputPaths, overwrite: bool) -> None:
         ]
         if path.exists()
     ]
-    if existing and not overwrite:
+    if existing and not overwrite and not resume:
         formatted = "\n".join(f"- {path}" for path in existing)
         raise FileExistsError(
             "Pilot attack outputs already exist. Refusing to overwrite them.\n"
             f"{formatted}\n"
-            "Rerun with --overwrite only when you intentionally want to replace them."
+            "Rerun with --resume to continue or --overwrite to intentionally replace them."
         )
+
+
+def empty_attempts_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=ATTEMPT_COLUMNS)
+
+
+def empty_results_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=RESULT_COLUMNS)
+
+
+def load_resume_frames(
+    output_paths: OutputPaths,
+    pool_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, set[tuple[int, str]], str | None]:
+    if output_paths.results.exists():
+        results_df = pd.read_csv(output_paths.results)
+        missing_result_columns = set(RESULT_COLUMNS) - set(results_df.columns)
+        if missing_result_columns:
+            raise ValueError(
+                f"{output_paths.results.name} is missing result columns required "
+                f"for resume: {sorted(missing_result_columns)}"
+            )
+        results_df = results_df[RESULT_COLUMNS].copy()
+    else:
+        results_df = empty_results_frame()
+
+    completed_pair_list = list(
+        zip(
+            pd.to_numeric(
+                results_df[ROW_ID_COLUMN],
+                errors="raise",
+            ).astype(int),
+            results_df["feedback_condition"].astype(str).str.strip(),
+        )
+    )
+    completed_pairs = set(completed_pair_list)
+    if len(completed_pairs) != len(completed_pair_list):
+        raise ValueError(
+            f"{output_paths.results.name} contains duplicate completed "
+            "(row_id, feedback_condition) pairs."
+        )
+
+    expected_pairs = {
+        (int(row_id), feedback_condition)
+        for row_id in pool_df[ROW_ID_COLUMN]
+        for feedback_condition in FEEDBACK_CONDITIONS
+    }
+    unexpected_pairs = completed_pairs - expected_pairs
+    if unexpected_pairs:
+        raise ValueError(
+            "Resume results contain completed pairs outside the selected pool: "
+            f"{sorted(unexpected_pairs)}"
+        )
+
+    if output_paths.attempts.exists():
+        attempts_df = pd.read_csv(output_paths.attempts)
+        required_attempt_columns = set(ATTEMPT_COLUMNS) - OPTIONAL_RESUME_ATTEMPT_COLUMNS
+        missing_attempt_columns = required_attempt_columns - set(attempts_df.columns)
+        if missing_attempt_columns:
+            raise ValueError(
+                f"{output_paths.attempts.name} is missing attempt columns required "
+                f"for resume: {sorted(missing_attempt_columns)}"
+            )
+        for column in OPTIONAL_RESUME_ATTEMPT_COLUMNS:
+            if column not in attempts_df.columns:
+                attempts_df[column] = None
+        attempts_df = attempts_df[ATTEMPT_COLUMNS].copy()
+    else:
+        attempts_df = empty_attempts_frame()
+
+    if not attempts_df.empty:
+        attempt_keys = list(
+            zip(
+                pd.to_numeric(
+                    attempts_df[ROW_ID_COLUMN],
+                    errors="raise",
+                ).astype(int),
+                attempts_df["feedback_condition"].astype(str).str.strip(),
+            )
+        )
+        completed_attempt_mask = pd.Series(
+            [key in completed_pairs for key in attempt_keys],
+            index=attempts_df.index,
+        )
+        discarded_attempts = int((~completed_attempt_mask).sum())
+        if discarded_attempts:
+            logging.warning(
+                "Discarding %s saved attempt rows for incomplete row/condition "
+                "pairs; those pairs will restart from attempt 1.",
+                discarded_attempts,
+            )
+        attempts_df = attempts_df.loc[completed_attempt_mask].reset_index(drop=True)
+
+    run_ids = set()
+    for frame in (results_df, attempts_df):
+        if not frame.empty:
+            run_ids.update(frame["run_id"].dropna().astype(str).unique())
+    if len(run_ids) > 1:
+        raise ValueError(
+            "Resume outputs contain multiple run_id values; refusing to combine them: "
+            f"{sorted(run_ids)}"
+        )
+    existing_run_id = next(iter(run_ids), None)
+    return attempts_df, results_df, completed_pairs, existing_run_id
+
+
+def save_attack_progress(
+    attempts_df: pd.DataFrame,
+    results_df: pd.DataFrame,
+    output_paths: OutputPaths,
+) -> None:
+    if results_df.duplicated(
+        subset=[ROW_ID_COLUMN, "feedback_condition"],
+        keep=False,
+    ).any():
+        raise ValueError(
+            "Refusing to save duplicate completed (row_id, feedback_condition) pairs."
+        )
+    attempts_df.to_csv(output_paths.attempts, index=False)
+    results_df.to_csv(output_paths.results, index=False)
 
 
 def pool_config(experiment_split: str) -> dict[str, object]:
@@ -2648,12 +2787,34 @@ def run_pilot_attack(
     paraphraser: Paraphraser,
     max_classifier_queries: int,
     max_generation_attempts: int,
+    output_paths: OutputPaths | None = None,
+    existing_attempts_df: pd.DataFrame | None = None,
+    existing_results_df: pd.DataFrame | None = None,
+    completed_pairs: set[tuple[int, str]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    all_attempt_rows: list[dict[str, object]] = []
-    result_rows: list[dict[str, object]] = []
+    attempts_df = (
+        existing_attempts_df.copy()
+        if existing_attempts_df is not None
+        else empty_attempts_frame()
+    )
+    results_df = (
+        existing_results_df.copy()
+        if existing_results_df is not None
+        else empty_results_frame()
+    )
+    completed = set(completed_pairs or set())
 
     for _, row in pilot_df.iterrows():
         for feedback_condition in FEEDBACK_CONDITIONS:
+            pair_key = (int(row[ROW_ID_COLUMN]), feedback_condition)
+            if pair_key in completed:
+                logging.info(
+                    "Skipping completed attack pair | row_id=%s | condition=%s",
+                    pair_key[0],
+                    pair_key[1],
+                )
+                continue
+
             attempt_rows, result_row = run_single_attack(
                 row=row,
                 feedback_condition=feedback_condition,
@@ -2664,11 +2825,30 @@ def run_pilot_attack(
                 max_classifier_queries=max_classifier_queries,
                 max_generation_attempts=max_generation_attempts,
             )
-            all_attempt_rows.extend(attempt_rows)
-            result_rows.append(result_row)
+            if attempt_rows:
+                new_attempts_df = pd.DataFrame(attempt_rows, columns=ATTEMPT_COLUMNS)
+                attempts_df = pd.concat(
+                    [attempts_df, new_attempts_df],
+                    ignore_index=True,
+                )
+            new_result_df = pd.DataFrame([result_row], columns=RESULT_COLUMNS)
+            results_df = pd.concat(
+                [results_df, new_result_df],
+                ignore_index=True,
+            )
+            completed.add(pair_key)
 
-    attempts_df = pd.DataFrame(all_attempt_rows, columns=ATTEMPT_COLUMNS)
-    results_df = pd.DataFrame(result_rows, columns=RESULT_COLUMNS)
+            if output_paths is not None:
+                save_attack_progress(
+                    attempts_df=attempts_df,
+                    results_df=results_df,
+                    output_paths=output_paths,
+                )
+                logging.info(
+                    "Saved progress | completed_pairs=%s",
+                    len(completed),
+                )
+
     return attempts_df, results_df
 
 
@@ -2968,12 +3148,11 @@ def main() -> None:
         return
 
     output_paths = build_output_paths(args.pool, args.paraphraser, args.output_tag)
-    check_output_paths(output_paths=output_paths, overwrite=args.overwrite)
-
-    run_id = datetime.now(timezone.utc).strftime(f"{args.pool}_%Y%m%dT%H%M%SZ")
-    logging.info("Starting %s attack run | run_id=%s", args.pool, run_id)
-    paraphraser = build_paraphraser(args)
-    logging.info("Using paraphraser mode: %s", args.paraphraser)
+    check_output_paths(
+        output_paths=output_paths,
+        overwrite=args.overwrite,
+        resume=args.resume,
+    )
 
     pool_df, pool_path = load_attack_pool(args.pool)
     if args.max_examples is not None:
@@ -2990,6 +3169,31 @@ def main() -> None:
         len(pool_df),
     )
 
+    if args.resume:
+        (
+            existing_attempts_df,
+            existing_results_df,
+            completed_pairs,
+            existing_run_id,
+        ) = load_resume_frames(output_paths, pool_df)
+        logging.info(
+            "Loaded resume state | completed_pairs=%s | saved_attempt_rows=%s",
+            len(completed_pairs),
+            len(existing_attempts_df),
+        )
+    else:
+        existing_attempts_df = empty_attempts_frame()
+        existing_results_df = empty_results_frame()
+        completed_pairs = set()
+        existing_run_id = None
+
+    run_id = existing_run_id or datetime.now(timezone.utc).strftime(
+        f"{args.pool}_%Y%m%dT%H%M%SZ"
+    )
+    logging.info("Starting %s attack run | run_id=%s", args.pool, run_id)
+    paraphraser = build_paraphraser(args)
+    logging.info("Using paraphraser mode: %s", args.paraphraser)
+
     logging.info("Loading classifier wrapper.")
     classifier = DeceptionClassifierWrapper()
 
@@ -3004,10 +3208,17 @@ def main() -> None:
         paraphraser=paraphraser,
         max_classifier_queries=args.max_classifier_queries,
         max_generation_attempts=args.max_generation_attempts,
+        output_paths=output_paths,
+        existing_attempts_df=existing_attempts_df,
+        existing_results_df=existing_results_df,
+        completed_pairs=completed_pairs,
     )
 
-    attempts_df.to_csv(output_paths.attempts, index=False)
-    results_df.to_csv(output_paths.results, index=False)
+    save_attack_progress(
+        attempts_df=attempts_df,
+        results_df=results_df,
+        output_paths=output_paths,
+    )
 
     run_post_run_integrity_checks(
         attempts_path=output_paths.attempts,
