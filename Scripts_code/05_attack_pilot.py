@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -52,6 +53,16 @@ RUN_NAME = "pilot_attack"
 DEFAULT_PARAPHRASER_MODE = "placeholder"
 INVALID_DEBUG_PARAPHRASER_MODE = "invalid_debug"
 LOCAL_LLM_PARAPHRASER_MODE = "local_llm"
+API_LLM_PARAPHRASER_MODE = "api_llm"
+
+DEFAULT_API_LLM_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_API_LLM_MODEL = ""
+DEFAULT_API_LLM_KEY_ENV = "OPENAI_API_KEY"
+DEFAULT_API_LLM_TIMEOUT_SECONDS = 120.0
+DEFAULT_API_LLM_MAX_RETRIES = 2
+DEFAULT_API_LLM_TEMPERATURE = 0.7
+DEFAULT_API_LLM_TOP_P = 0.9
+DEFAULT_API_LLM_MAX_TOKENS = 120
 
 DEFAULT_LOCAL_LLM_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
 DEFAULT_LOCAL_LLM_MODEL_PATH = (
@@ -154,6 +165,10 @@ ATTEMPT_COLUMNS = [
     "generation_seconds",
     "generated_token_count",
     "generation_tokens_per_second",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "raw_usage_json",
 ]
 
 RESULT_COLUMNS = [
@@ -222,6 +237,10 @@ class GenerationRuntime:
     generation_seconds: float | None = None
     generated_token_count: int | None = None
     generation_tokens_per_second: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    raw_usage_json: str | None = None
 
 
 class Paraphraser(Protocol):
@@ -1322,12 +1341,261 @@ class LlamaCppServerLocalLLMParaphraser:
         }
 
 
+class ApiLLMParaphraser:
+    """OpenAI-compatible external API backend using the shared attack prompts."""
+
+    SYSTEM_PROMPT_TEMPLATE = LocalLLMParaphraser.SYSTEM_PROMPT_TEMPLATE
+    LABEL_ONLY_FEEDBACK_TEMPLATE = LocalLLMParaphraser.LABEL_ONLY_FEEDBACK_TEMPLATE
+    SCORE_BASED_FEEDBACK_TEMPLATE = LocalLLMParaphraser.SCORE_BASED_FEEDBACK_TEMPLATE
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        key_env: str = DEFAULT_API_LLM_KEY_ENV,
+        timeout_seconds: float = DEFAULT_API_LLM_TIMEOUT_SECONDS,
+        max_retries: int = DEFAULT_API_LLM_MAX_RETRIES,
+        temperature: float = DEFAULT_API_LLM_TEMPERATURE,
+        top_p: float = DEFAULT_API_LLM_TOP_P,
+        max_tokens: int = DEFAULT_API_LLM_MAX_TOKENS,
+        prompt_version: str = LOCAL_LLM_PROMPT_VERSION,
+    ) -> None:
+        self.base_url = self._normalize_base_url(base_url)
+        self.model = str(model).strip()
+        self.key_env = str(key_env).strip()
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_retries = int(max_retries)
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.max_tokens = int(max_tokens)
+        self.prompt_version = LocalLLMParaphraser._validate_prompt_version(
+            prompt_version
+        )
+        self.user_prompt_template = LocalLLMParaphraser._select_user_prompt_template(
+            self.prompt_version
+        )
+        self._last_generation_runtime = GenerationRuntime()
+
+        if not self.model:
+            raise ValueError("--api-llm-model must not be empty.")
+        if not self.key_env:
+            raise ValueError("--api-llm-key-env must not be empty.")
+
+        api_key = os.environ.get(self.key_env)
+        if api_key is None or not api_key.strip():
+            raise RuntimeError(
+                f"API key environment variable {self.key_env!r} is not set or is empty."
+            )
+        self._api_key = api_key.strip()
+
+    @staticmethod
+    def _normalize_base_url(base_url: str) -> str:
+        normalized = str(base_url).strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if not normalized or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "--api-llm-base-url must be a non-empty absolute http(s) URL."
+            )
+        return normalized
+
+    @staticmethod
+    def _extract_generated_text(response: dict[str, object]) -> str:
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("API response did not include choices.")
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise RuntimeError("API response choice had an unexpected shape.")
+        message = first_choice.get("message")
+        if not isinstance(message, dict) or message.get("content") is None:
+            raise RuntimeError("API response did not include choices[0].message.content.")
+        return str(message["content"])
+
+    @staticmethod
+    def _usage_value(usage: dict[str, object], name: str) -> int | None:
+        value = usage.get(name)
+        return int(value) if value is not None else None
+
+    def _post_chat_completion(self, payload: dict[str, object]) -> dict[str, object]:
+        url = f"{self.base_url}/chat/completions"
+        body = json.dumps(payload).encode("utf-8")
+
+        for attempt in range(self.max_retries + 1):
+            request = Request(
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    raw = response.read().decode("utf-8")
+            except HTTPError as exc:
+                retryable = exc.code in {408, 429} or 500 <= exc.code < 600
+                if not retryable or attempt >= self.max_retries:
+                    raise RuntimeError(
+                        f"API generation request failed with HTTP {exc.code}."
+                    ) from exc
+                logging.warning(
+                    "API generation request returned HTTP %s; retrying (%s/%s).",
+                    exc.code,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                time.sleep(min(2**attempt, 5))
+                continue
+            except (URLError, TimeoutError) as exc:
+                if attempt >= self.max_retries:
+                    raise RuntimeError(
+                        "API generation request failed after retryable network errors."
+                    ) from exc
+                logging.warning(
+                    "API generation request had a retryable network error; "
+                    "retrying (%s/%s).",
+                    attempt + 1,
+                    self.max_retries,
+                )
+                time.sleep(min(2**attempt, 5))
+                continue
+
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("API generation response was not valid JSON.") from exc
+            if not isinstance(decoded, dict):
+                raise RuntimeError("API generation response had an unexpected JSON shape.")
+            return decoded
+
+        raise RuntimeError("API generation request failed unexpectedly.")
+
+    def generate(
+        self,
+        original_text: str,
+        attempt_index: int,
+        feedback: AttackFeedback,
+        row_id: int,
+    ) -> str:
+        self._last_generation_runtime = GenerationRuntime()
+        messages = LocalLLMParaphraser._build_messages(
+            self,
+            original_text=normalize_text(original_text),
+            feedback=feedback,
+            attempt_index=attempt_index,
+        )
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+        }
+
+        start_time = time.perf_counter()
+        response = self._post_chat_completion(payload)
+        generation_seconds = time.perf_counter() - start_time
+
+        usage = response.get("usage")
+        usage_dict = usage if isinstance(usage, dict) else None
+        prompt_tokens = (
+            self._usage_value(usage_dict, "prompt_tokens") if usage_dict else None
+        )
+        completion_tokens = (
+            self._usage_value(usage_dict, "completion_tokens") if usage_dict else None
+        )
+        total_tokens = (
+            self._usage_value(usage_dict, "total_tokens") if usage_dict else None
+        )
+        raw_usage_json = (
+            json.dumps(usage_dict, ensure_ascii=True, sort_keys=True)
+            if usage_dict is not None
+            else None
+        )
+        tokens_per_second = (
+            completion_tokens / generation_seconds
+            if completion_tokens is not None and generation_seconds > 0
+            else None
+        )
+        self._last_generation_runtime = GenerationRuntime(
+            generation_seconds=generation_seconds,
+            generated_token_count=completion_tokens,
+            generation_tokens_per_second=tokens_per_second,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            raw_usage_json=raw_usage_json,
+        )
+        logging.info(
+            "API LLM generation timing | row_id=%s | condition=%s | attempt=%s | "
+            "seconds=%.3f | prompt_tokens=%s | completion_tokens=%s | total_tokens=%s",
+            row_id,
+            feedback.feedback_condition,
+            attempt_index,
+            generation_seconds,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+
+        generated_text = self._extract_generated_text(response)
+        return LocalLLMParaphraser._clean_generated_text(generated_text)
+
+    def get_last_generation_runtime(self) -> GenerationRuntime:
+        return self._last_generation_runtime
+
+    def get_metadata(self) -> dict[str, object]:
+        prompt_material = "\n\n".join(
+            [
+                self.SYSTEM_PROMPT_TEMPLATE,
+                self.user_prompt_template,
+                self.LABEL_ONLY_FEEDBACK_TEMPLATE,
+                self.SCORE_BASED_FEEDBACK_TEMPLATE,
+                "\n".join(
+                    LocalLLMParaphraser.rewrite_strategy_for_attempt(i)
+                    for i in range(1, 6)
+                ),
+            ]
+        )
+        prompt_hash = hashlib.sha256(prompt_material.encode("utf-8")).hexdigest()
+        return {
+            "mode": API_LLM_PARAPHRASER_MODE,
+            "name": type(self).__name__,
+            "backend": "openai_compatible_chat_completions",
+            "uses_external_api": True,
+            "base_url": self.base_url,
+            "model": self.model,
+            "key_env": self.key_env,
+            "timeout_seconds": self.timeout_seconds,
+            "max_retries": self.max_retries,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
+            "prompt_version": self.prompt_version,
+            "prompt_template_sha256": prompt_hash,
+        }
+
+
 def build_paraphraser(args: argparse.Namespace) -> Paraphraser:
     mode = args.paraphraser
     if mode == DEFAULT_PARAPHRASER_MODE:
         return PlaceholderParaphraser()
     if mode == INVALID_DEBUG_PARAPHRASER_MODE:
         return InvalidDebugParaphraser()
+    if mode == API_LLM_PARAPHRASER_MODE:
+        return ApiLLMParaphraser(
+            base_url=args.api_llm_base_url,
+            model=args.api_llm_model,
+            key_env=args.api_llm_key_env,
+            timeout_seconds=args.api_llm_timeout_seconds,
+            max_retries=args.api_llm_max_retries,
+            temperature=args.api_llm_temperature,
+            top_p=args.api_llm_top_p,
+            max_tokens=args.api_llm_max_tokens,
+            prompt_version=args.local_llm_prompt_version,
+        )
     if mode == LOCAL_LLM_PARAPHRASER_MODE:
         if args.local_llm_backend == LOCAL_LLM_LLAMA_CPP_SERVER_BACKEND:
             return LlamaCppServerLocalLLMParaphraser(
@@ -1398,9 +1666,11 @@ def parse_args() -> argparse.Namespace:
             DEFAULT_PARAPHRASER_MODE,
             INVALID_DEBUG_PARAPHRASER_MODE,
             LOCAL_LLM_PARAPHRASER_MODE,
+            API_LLM_PARAPHRASER_MODE,
         ],
         help=(
-            "Paraphraser mode. local_llm uses the fixed local Qwen paraphraser."
+            "Paraphraser mode. local_llm uses the fixed local Qwen paraphraser; "
+            "api_llm calls an OpenAI-compatible external API."
         ),
     )
     parser.add_argument(
@@ -1455,6 +1725,54 @@ def parse_args() -> argparse.Namespace:
             "Optional safe suffix for output files, e.g. gen6_query3. "
             "When omitted, preserves the original filenames."
         ),
+    )
+    parser.add_argument(
+        "--api-llm-base-url",
+        default=DEFAULT_API_LLM_BASE_URL,
+        help=(
+            "OpenAI-compatible API base URL, normally ending in /v1. "
+            "The script posts to <base-url>/chat/completions."
+        ),
+    )
+    parser.add_argument(
+        "--api-llm-model",
+        default=DEFAULT_API_LLM_MODEL,
+        help="Provider model name used by --paraphraser api_llm.",
+    )
+    parser.add_argument(
+        "--api-llm-key-env",
+        default=DEFAULT_API_LLM_KEY_ENV,
+        help="Environment variable containing the API key. Only its name is logged.",
+    )
+    parser.add_argument(
+        "--api-llm-timeout-seconds",
+        type=float,
+        default=DEFAULT_API_LLM_TIMEOUT_SECONDS,
+        help="Timeout for each OpenAI-compatible API request.",
+    )
+    parser.add_argument(
+        "--api-llm-max-retries",
+        type=int,
+        default=DEFAULT_API_LLM_MAX_RETRIES,
+        help="Retries after network, timeout, HTTP 408/429, or HTTP 5xx failures.",
+    )
+    parser.add_argument(
+        "--api-llm-temperature",
+        type=float,
+        default=DEFAULT_API_LLM_TEMPERATURE,
+        help="Sampling temperature for API paraphrases.",
+    )
+    parser.add_argument(
+        "--api-llm-top-p",
+        type=float,
+        default=DEFAULT_API_LLM_TOP_P,
+        help="Nucleus sampling top_p for API paraphrases.",
+    )
+    parser.add_argument(
+        "--api-llm-max-tokens",
+        type=int,
+        default=DEFAULT_API_LLM_MAX_TOKENS,
+        help="Maximum completion tokens for each API paraphrase.",
     )
     parser.add_argument(
         "--local-llm-model-id",
@@ -1614,9 +1932,9 @@ def parse_args() -> argparse.Namespace:
         default=LOCAL_LLM_PROMPT_VERSION,
         choices=list(LOCAL_LLM_PROMPT_VERSIONS),
         help=(
-            "Prompt template version for local_llm. The v2 default preserves "
-            "previous behavior; v3 adds conservative non-identical rewrite "
-            "instructions and attempt-specific strategies."
+            "Shared prompt template version for local_llm and api_llm. The v2 "
+            "default preserves previous behavior; v3 adds conservative "
+            "non-identical rewrite instructions and attempt-specific strategies."
         ),
     )
     args = parser.parse_args()
@@ -1647,6 +1965,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--local-llm-context-size must be positive.")
     if args.local_llm_request_timeout_seconds <= 0:
         raise ValueError("--local-llm-request-timeout-seconds must be positive.")
+    if args.api_llm_timeout_seconds <= 0:
+        raise ValueError("--api-llm-timeout-seconds must be positive.")
+    if args.api_llm_max_retries < 0:
+        raise ValueError("--api-llm-max-retries must be non-negative.")
+    if args.api_llm_temperature < 0:
+        raise ValueError("--api-llm-temperature must be non-negative.")
+    if not 0 < args.api_llm_top_p <= 1:
+        raise ValueError("--api-llm-top-p must be in (0, 1].")
+    if args.api_llm_max_tokens <= 0:
+        raise ValueError("--api-llm-max-tokens must be positive.")
+    if args.paraphraser == API_LLM_PARAPHRASER_MODE:
+        if not str(args.api_llm_model).strip():
+            raise ValueError("--api-llm-model is required for --paraphraser api_llm.")
+        if not str(args.api_llm_key_env).strip():
+            raise ValueError("--api-llm-key-env must not be empty.")
     if args.output_tag is not None:
         normalized_tag = str(args.output_tag).strip()
         if not normalized_tag:
@@ -2253,6 +2586,10 @@ def run_single_attack(
                 "generation_tokens_per_second": (
                     generation_runtime.generation_tokens_per_second
                 ),
+                "prompt_tokens": generation_runtime.prompt_tokens,
+                "completion_tokens": generation_runtime.completion_tokens,
+                "total_tokens": generation_runtime.total_tokens,
+                "raw_usage_json": generation_runtime.raw_usage_json,
             }
         )
 
