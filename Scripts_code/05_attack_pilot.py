@@ -35,6 +35,7 @@ OUTPUT_DIR = SCRIPTS_DIR / "outputs"
 PILOT_POOL_PATH = OUTPUT_DIR / "candidate_pool_pilot_20.csv"
 MAIN_POOL_PATH = OUTPUT_DIR / "candidate_pool_main_160.csv"
 EXPLORATORY_POOL_PATH = OUTPUT_DIR / "candidate_pool_exploratory_remaining.csv"
+UNIFIED_POOL_PATH = OUTPUT_DIR / "candidate_pool_test_final.csv"
 
 CLASSIFIER_WRAPPER_PATH = SCRIPTS_DIR / "03_classifier_wrapper.py"
 VALIDITY_CHECKS_PATH = SCRIPTS_DIR / "04_validity_checks.py"
@@ -94,6 +95,7 @@ LOCAL_LLM_PROMPT_VERSIONS = (
 PILOT_POOL_NAME = "pilot"
 MAIN_POOL_NAME = "main"
 EXPLORATORY_POOL_NAME = "exploratory"
+UNIFIED_POOL_NAME = "unified"
 POOL_CONFIGS = {
     PILOT_POOL_NAME: {
         "path": PILOT_POOL_PATH,
@@ -110,6 +112,17 @@ POOL_CONFIGS = {
         "expected_source_split": "test_final",
         "expected_full_pool_size": 229,
     },
+    UNIFIED_POOL_NAME: {
+        "path": UNIFIED_POOL_PATH,
+        "expected_source_split": "test_final",
+        "expected_full_pool_size": 389,
+        "expected_label_counts": {
+            "truthful": 170,
+            "deceptive": 219,
+        },
+        "require_unique_source_row_keys": True,
+        "require_unique_text_hashes": True,
+    },
 }
 ATTACK_TEXT_COLUMN = "attack_text"
 ROW_ID_COLUMN = "row_id"
@@ -117,6 +130,7 @@ GOLD_LABEL_NAME_COLUMN = "gold_label_name"
 CORRECT_COLUMN = "correct"
 SOURCE_SPLIT_COLUMN = "source_split"
 SOURCE_TEXT_COLUMN = "source_text_column"
+TEXT_HASH_COLUMN = "text_hash"
 
 ATTEMPT_COLUMNS = [
     "run_id",
@@ -1421,11 +1435,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pool",
         default=PILOT_POOL_NAME,
-        choices=[PILOT_POOL_NAME, MAIN_POOL_NAME, EXPLORATORY_POOL_NAME],
+        choices=[
+            PILOT_POOL_NAME,
+            MAIN_POOL_NAME,
+            EXPLORATORY_POOL_NAME,
+            UNIFIED_POOL_NAME,
+        ],
         help=(
             "Candidate pool to attack. pilot preserves the previous train-dev "
             "pilot behavior; main uses the frozen 160-row final-test pool; "
-            "exploratory uses the held-out final-test remainder."
+            "exploratory uses the held-out final-test remainder; unified uses "
+            "the complete 389-row final-test candidate pool."
         ),
     )
     parser.add_argument(
@@ -1908,6 +1928,58 @@ def validate_attack_pool(df: pd.DataFrame, experiment_split: str, pool_path: Pat
     )
     if empty_texts:
         raise ValueError(f"{pool_path.name} contains {empty_texts} empty attack texts.")
+
+    if config.get("require_unique_source_row_keys"):
+        duplicate_source_row_keys = int(
+            df[[SOURCE_SPLIT_COLUMN, ROW_ID_COLUMN]]
+            .astype(str)
+            .duplicated()
+            .sum()
+        )
+        if duplicate_source_row_keys:
+            raise ValueError(
+                f"{pool_path.name} contains {duplicate_source_row_keys} duplicate "
+                "(source_split, row_id) keys."
+            )
+
+    if config.get("require_unique_text_hashes"):
+        if TEXT_HASH_COLUMN not in df.columns:
+            raise ValueError(
+                f"{pool_path.name} is missing required column: {TEXT_HASH_COLUMN}"
+            )
+        duplicate_text_hashes = int(
+            df[TEXT_HASH_COLUMN].astype(str).str.strip().duplicated().sum()
+        )
+        if duplicate_text_hashes:
+            raise ValueError(
+                f"{pool_path.name} contains {duplicate_text_hashes} duplicate "
+                "text_hash values."
+            )
+
+    expected_label_counts = config.get("expected_label_counts")
+    if isinstance(expected_label_counts, dict):
+        expected_full_pool_size = int(config["expected_full_pool_size"])
+        if len(df) != expected_full_pool_size:
+            raise ValueError(
+                f"{pool_path.name} has {len(df)} rows, expected "
+                f"{expected_full_pool_size}."
+            )
+
+        label_counts = {
+            str(label): int(count)
+            for label, count in df[GOLD_LABEL_NAME_COLUMN]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .value_counts()
+            .to_dict()
+            .items()
+        }
+        if label_counts != expected_label_counts:
+            raise ValueError(
+                f"{pool_path.name} has class counts {label_counts}, expected "
+                f"{expected_label_counts}."
+            )
 
 
 def load_attack_pool(experiment_split: str) -> tuple[pd.DataFrame, Path]:
