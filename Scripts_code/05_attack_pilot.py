@@ -63,6 +63,8 @@ DEFAULT_API_LLM_MAX_RETRIES = 2
 DEFAULT_API_LLM_TEMPERATURE = 0.7
 DEFAULT_API_LLM_TOP_P = 0.9
 DEFAULT_API_LLM_MAX_TOKENS = 120
+DEFAULT_API_LLM_COST_PER_1M_INPUT = 0.10
+DEFAULT_API_LLM_COST_PER_1M_OUTPUT = 0.32
 
 DEFAULT_LOCAL_LLM_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
 DEFAULT_LOCAL_LLM_MODEL_PATH = (
@@ -165,12 +167,18 @@ ATTEMPT_COLUMNS = [
     "generation_seconds",
     "generated_token_count",
     "generation_tokens_per_second",
+    "prompt_token_count",
+    "completion_token_count",
+    "total_token_count",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
     "raw_usage_json",
 ]
 OPTIONAL_RESUME_ATTEMPT_COLUMNS = {
+    "prompt_token_count",
+    "completion_token_count",
+    "total_token_count",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
@@ -277,6 +285,15 @@ class OutputPaths:
     attempts: Path
     results: Path
     metadata: Path
+
+
+@dataclass(frozen=True)
+class AttackRunOutcome:
+    attempts_df: pd.DataFrame
+    results_df: pd.DataFrame
+    spend_guard_triggered: bool = False
+    estimated_cost_usd: float | None = None
+    run_stop_reason: str = "completed"
 
 
 # =========================
@@ -1477,6 +1494,19 @@ class ApiLLMParaphraser:
 
         raise RuntimeError("API generation request failed unexpectedly.")
 
+    def run_preflight(self) -> None:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "Reply with exactly: ok"}],
+            "temperature": 0,
+            "max_tokens": 3,
+            "stream": False,
+        }
+        response = self._post_chat_completion(payload)
+        generated_text = self._extract_generated_text(response).strip()
+        if not generated_text:
+            raise RuntimeError("API preflight returned an empty chat completion.")
+
     def generate(
         self,
         original_text: str,
@@ -1790,6 +1820,32 @@ def parse_args() -> argparse.Namespace:
         help="Maximum completion tokens for each API paraphrase.",
     )
     parser.add_argument(
+        "--skip-api-preflight",
+        action="store_true",
+        help="Skip the default cheap API key/endpoint/model chat-completion check.",
+    )
+    parser.add_argument(
+        "--max-spend-usd",
+        type=float,
+        default=None,
+        help=(
+            "Stop cleanly after a completed pair when estimated API token cost "
+            "reaches this USD limit. Unset by default."
+        ),
+    )
+    parser.add_argument(
+        "--api-llm-cost-per-1m-input",
+        type=float,
+        default=DEFAULT_API_LLM_COST_PER_1M_INPUT,
+        help="Estimated USD cost per one million API input tokens.",
+    )
+    parser.add_argument(
+        "--api-llm-cost-per-1m-output",
+        type=float,
+        default=DEFAULT_API_LLM_COST_PER_1M_OUTPUT,
+        help="Estimated USD cost per one million API output tokens.",
+    )
+    parser.add_argument(
         "--local-llm-model-id",
         default=DEFAULT_LOCAL_LLM_MODEL_ID,
         help="Fixed Hugging Face model id for engineering/freeze metadata.",
@@ -1990,6 +2046,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--api-llm-top-p must be in (0, 1].")
     if args.api_llm_max_tokens <= 0:
         raise ValueError("--api-llm-max-tokens must be positive.")
+    if args.max_spend_usd is not None and args.max_spend_usd <= 0:
+        raise ValueError("--max-spend-usd must be positive when provided.")
+    if args.api_llm_cost_per_1m_input < 0:
+        raise ValueError("--api-llm-cost-per-1m-input must be non-negative.")
+    if args.api_llm_cost_per_1m_output < 0:
+        raise ValueError("--api-llm-cost-per-1m-output must be non-negative.")
     if args.paraphraser == API_LLM_PARAPHRASER_MODE:
         if not str(args.api_llm_model).strip():
             raise ValueError("--api-llm-model is required for --paraphraser api_llm.")
@@ -2345,6 +2407,112 @@ def save_attack_progress(
         )
     attempts_df.to_csv(output_paths.attempts, index=False)
     results_df.to_csv(output_paths.results, index=False)
+
+
+def coalesced_numeric_series(
+    attempts_df: pd.DataFrame,
+    columns: tuple[str, ...],
+) -> pd.Series:
+    values = pd.Series(float("nan"), index=attempts_df.index, dtype="float64")
+    for column in columns:
+        if column in attempts_df.columns:
+            candidate = pd.to_numeric(attempts_df[column], errors="coerce")
+            values = values.fillna(candidate)
+    return values
+
+
+def numeric_token_total(
+    attempts_df: pd.DataFrame,
+    columns: tuple[str, ...],
+    require_complete: bool = False,
+) -> int | None:
+    values = coalesced_numeric_series(attempts_df, columns)
+    if require_complete and (values.empty or values.isna().any()):
+        return None
+    return int(values.sum()) if values.notna().any() else None
+
+
+def estimate_api_cost_usd(
+    attempts_df: pd.DataFrame,
+    input_cost_per_1m: float,
+    output_cost_per_1m: float,
+) -> tuple[int | None, int | None, float | None]:
+    input_tokens = numeric_token_total(
+        attempts_df,
+        ("prompt_token_count", "prompt_tokens"),
+        require_complete=True,
+    )
+    output_tokens = numeric_token_total(
+        attempts_df,
+        (
+            "completion_token_count",
+            "completion_tokens",
+            "generated_token_count",
+        ),
+        require_complete=True,
+    )
+    if input_tokens is None or output_tokens is None:
+        return input_tokens, output_tokens, None
+    estimated_cost = (
+        input_tokens / 1_000_000 * input_cost_per_1m
+        + output_tokens / 1_000_000 * output_cost_per_1m
+    )
+    return input_tokens, output_tokens, estimated_cost
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def log_attack_progress(
+    attempts_df: pd.DataFrame,
+    results_df: pd.DataFrame,
+    completed_pairs: int,
+    total_pairs: int,
+    newly_completed_pairs: int,
+    started_at: float,
+    input_cost_per_1m: float,
+    output_cost_per_1m: float,
+) -> float | None:
+    elapsed_seconds = time.perf_counter() - started_at
+    remaining_pairs = max(total_pairs - completed_pairs, 0)
+    eta_seconds = (
+        elapsed_seconds / newly_completed_pairs * remaining_pairs
+        if newly_completed_pairs > 0
+        else None
+    )
+    input_tokens, output_tokens, estimated_cost = estimate_api_cost_usd(
+        attempts_df,
+        input_cost_per_1m=input_cost_per_1m,
+        output_cost_per_1m=output_cost_per_1m,
+    )
+    successes = (
+        int(as_bool_series(results_df["success"]).sum())
+        if not results_df.empty
+        else 0
+    )
+    percentage = completed_pairs / total_pairs * 100 if total_pairs else 100.0
+    message = (
+        f"[{completed_pairs}/{total_pairs} | {percentage:.1f}% | "
+        f"elapsed {format_duration(elapsed_seconds)} | "
+        f"ETA ~{format_duration(eta_seconds)} | attempts {len(attempts_df)} | "
+        f"input_tokens {input_tokens if input_tokens is not None else 'NA'} | "
+        f"output_tokens {output_tokens if output_tokens is not None else 'NA'} | "
+        f"est_cost "
+        f"{f'${estimated_cost:.4f}' if estimated_cost is not None else 'NA'} | "
+        f"successes {successes}]"
+    )
+    logging.info(message)
+    return estimated_cost
 
 
 def pool_config(experiment_split: str) -> dict[str, object]:
@@ -2725,6 +2893,9 @@ def run_single_attack(
                 "generation_tokens_per_second": (
                     generation_runtime.generation_tokens_per_second
                 ),
+                "prompt_token_count": generation_runtime.prompt_tokens,
+                "completion_token_count": generation_runtime.completion_tokens,
+                "total_token_count": generation_runtime.total_tokens,
                 "prompt_tokens": generation_runtime.prompt_tokens,
                 "completion_tokens": generation_runtime.completion_tokens,
                 "total_tokens": generation_runtime.total_tokens,
@@ -2791,7 +2962,10 @@ def run_pilot_attack(
     existing_attempts_df: pd.DataFrame | None = None,
     existing_results_df: pd.DataFrame | None = None,
     completed_pairs: set[tuple[int, str]] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    max_spend_usd: float | None = None,
+    input_cost_per_1m: float = DEFAULT_API_LLM_COST_PER_1M_INPUT,
+    output_cost_per_1m: float = DEFAULT_API_LLM_COST_PER_1M_OUTPUT,
+) -> AttackRunOutcome:
     attempts_df = (
         existing_attempts_df.copy()
         if existing_attempts_df is not None
@@ -2803,6 +2977,44 @@ def run_pilot_attack(
         else empty_results_frame()
     )
     completed = set(completed_pairs or set())
+    initial_completed_pairs = len(completed)
+    total_pairs = len(pilot_df) * len(FEEDBACK_CONDITIONS)
+    started_at = time.perf_counter()
+    _, _, initial_estimated_cost = estimate_api_cost_usd(
+        attempts_df,
+        input_cost_per_1m=input_cost_per_1m,
+        output_cost_per_1m=output_cost_per_1m,
+    )
+    if (
+        len(completed) < total_pairs
+        and max_spend_usd is not None
+        and initial_estimated_cost is not None
+        and initial_estimated_cost >= max_spend_usd
+    ):
+        log_attack_progress(
+            attempts_df=attempts_df,
+            results_df=results_df,
+            completed_pairs=len(completed),
+            total_pairs=total_pairs,
+            newly_completed_pairs=0,
+            started_at=started_at,
+            input_cost_per_1m=input_cost_per_1m,
+            output_cost_per_1m=output_cost_per_1m,
+        )
+        logging.warning(
+            "Spend guard triggered before a new pair. Existing estimated cost "
+            "$%.4f meets or exceeds limit $%.4f. Progress is preserved. Re-run "
+            "with a higher limit and --resume to continue.",
+            initial_estimated_cost,
+            max_spend_usd,
+        )
+        return AttackRunOutcome(
+            attempts_df=attempts_df,
+            results_df=results_df,
+            spend_guard_triggered=True,
+            estimated_cost_usd=initial_estimated_cost,
+            run_stop_reason="spend_guard",
+        )
 
     for _, row in pilot_df.iterrows():
         for feedback_condition in FEEDBACK_CONDITIONS:
@@ -2849,7 +3061,47 @@ def run_pilot_attack(
                     len(completed),
                 )
 
-    return attempts_df, results_df
+            estimated_cost = log_attack_progress(
+                attempts_df=attempts_df,
+                results_df=results_df,
+                completed_pairs=len(completed),
+                total_pairs=total_pairs,
+                newly_completed_pairs=len(completed) - initial_completed_pairs,
+                started_at=started_at,
+                input_cost_per_1m=input_cost_per_1m,
+                output_cost_per_1m=output_cost_per_1m,
+            )
+            if (
+                len(completed) < total_pairs
+                and max_spend_usd is not None
+                and estimated_cost is not None
+                and estimated_cost >= max_spend_usd
+            ):
+                logging.warning(
+                    "Spend guard triggered. Estimated cost $%.4f meets or exceeds "
+                    "limit $%.4f. Progress saved. Re-run with a higher limit and "
+                    "--resume to continue.",
+                    estimated_cost,
+                    max_spend_usd,
+                )
+                return AttackRunOutcome(
+                    attempts_df=attempts_df,
+                    results_df=results_df,
+                    spend_guard_triggered=True,
+                    estimated_cost_usd=estimated_cost,
+                    run_stop_reason="spend_guard",
+                )
+
+    _, _, estimated_cost = estimate_api_cost_usd(
+        attempts_df,
+        input_cost_per_1m=input_cost_per_1m,
+        output_cost_per_1m=output_cost_per_1m,
+    )
+    return AttackRunOutcome(
+        attempts_df=attempts_df,
+        results_df=results_df,
+        estimated_cost_usd=estimated_cost,
+    )
 
 
 def as_bool_series(series: pd.Series) -> pd.Series:
@@ -3031,6 +3283,12 @@ def build_metadata(
     max_generation_attempts: int,
     max_examples: int | None,
     output_tag: str | None,
+    max_spend_usd: float | None,
+    input_cost_per_1m: float,
+    output_cost_per_1m: float,
+    api_preflight_enabled: bool,
+    spend_guard_triggered: bool,
+    run_stop_reason: str,
 ) -> dict[str, object]:
     if not attempts_df.empty and "generation_seconds" in attempts_df.columns:
         generation_seconds = pd.to_numeric(
@@ -3054,6 +3312,28 @@ def build_metadata(
         "mode": paraphraser_mode,
         "name": type(paraphraser).__name__,
     }
+    input_tokens, output_tokens, estimated_cost_usd = estimate_api_cost_usd(
+        attempts_df,
+        input_cost_per_1m=input_cost_per_1m,
+        output_cost_per_1m=output_cost_per_1m,
+    )
+    total_tokens = numeric_token_total(
+        attempts_df,
+        ("total_token_count", "total_tokens"),
+        require_complete=True,
+    )
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    estimated_input_cost_usd = (
+        input_tokens / 1_000_000 * input_cost_per_1m
+        if input_tokens is not None
+        else None
+    )
+    estimated_output_cost_usd = (
+        output_tokens / 1_000_000 * output_cost_per_1m
+        if output_tokens is not None
+        else None
+    )
 
     return {
         "run_id": run_id,
@@ -3062,6 +3342,7 @@ def build_metadata(
         "seed": seed,
         "experiment_split": experiment_split,
         "output_tag": output_tag,
+        "run_stop_reason": run_stop_reason,
         "input_pool": {
             "path": str(pool_path),
             "sha256": compute_file_hash(pool_path),
@@ -3086,6 +3367,16 @@ def build_metadata(
             "duplicate_candidates_count_as_classifier_queries": False,
         },
         "budget_config": f"gen{max_generation_attempts}_query{max_classifier_queries}",
+        "spend_monitoring": {
+            "max_spend_usd": max_spend_usd,
+            "api_llm_cost_per_1m_input": input_cost_per_1m,
+            "api_llm_cost_per_1m_output": output_cost_per_1m,
+            "api_preflight_enabled": api_preflight_enabled,
+            "spend_guard_triggered": spend_guard_triggered,
+            "estimated_input_cost_usd": estimated_input_cost_usd,
+            "estimated_output_cost_usd": estimated_output_cost_usd,
+            "estimated_total_cost_usd": estimated_cost_usd,
+        },
         "success_definition": (
             "valid paraphrase + classifier prediction flip from the verified "
             "original prediction + within classifier-query budget"
@@ -3136,6 +3427,14 @@ def build_metadata(
                 if not tokens_per_second.empty
                 else None,
             },
+            "token_usage": {
+                "prompt_token_count": input_tokens,
+                "completion_token_count": output_tokens,
+                "total_token_count": total_tokens,
+                "estimated_input_cost_usd": estimated_input_cost_usd,
+                "estimated_output_cost_usd": estimated_output_cost_usd,
+                "estimated_total_cost_usd": estimated_cost_usd,
+            },
         },
     }
 
@@ -3153,6 +3452,36 @@ def main() -> None:
         overwrite=args.overwrite,
         resume=args.resume,
     )
+
+    paraphraser: Paraphraser | None = None
+    if args.paraphraser == API_LLM_PARAPHRASER_MODE:
+        try:
+            paraphraser = build_paraphraser(args)
+        except Exception as exc:
+            logging.error(
+                "API setup failed before the attack loop: %s No attack outputs "
+                "were touched.",
+                exc,
+            )
+            raise SystemExit(1) from None
+        logging.info("Using paraphraser mode: %s", args.paraphraser)
+        if not args.skip_api_preflight:
+            logging.info(
+                "Running API preflight | base_url=%s | model=%s | key_env=%s",
+                args.api_llm_base_url,
+                args.api_llm_model,
+                args.api_llm_key_env,
+            )
+            try:
+                assert isinstance(paraphraser, ApiLLMParaphraser)
+                paraphraser.run_preflight()
+            except Exception as exc:
+                logging.error(
+                    "API preflight failed: %s No attack outputs were touched.",
+                    exc,
+                )
+                raise SystemExit(1) from None
+            logging.info("API preflight succeeded.")
 
     pool_df, pool_path = load_attack_pool(args.pool)
     if args.max_examples is not None:
@@ -3191,8 +3520,9 @@ def main() -> None:
         f"{args.pool}_%Y%m%dT%H%M%SZ"
     )
     logging.info("Starting %s attack run | run_id=%s", args.pool, run_id)
-    paraphraser = build_paraphraser(args)
-    logging.info("Using paraphraser mode: %s", args.paraphraser)
+    if paraphraser is None:
+        paraphraser = build_paraphraser(args)
+        logging.info("Using paraphraser mode: %s", args.paraphraser)
 
     logging.info("Loading classifier wrapper.")
     classifier = DeceptionClassifierWrapper()
@@ -3200,7 +3530,7 @@ def main() -> None:
     logging.info("Loading validity checker.")
     validity_checker = ParaphraseValidityChecker()
 
-    attempts_df, results_df = run_pilot_attack(
+    outcome = run_pilot_attack(
         pilot_df=pool_df,
         run_id=run_id,
         classifier=classifier,
@@ -3212,7 +3542,12 @@ def main() -> None:
         existing_attempts_df=existing_attempts_df,
         existing_results_df=existing_results_df,
         completed_pairs=completed_pairs,
+        max_spend_usd=args.max_spend_usd,
+        input_cost_per_1m=args.api_llm_cost_per_1m_input,
+        output_cost_per_1m=args.api_llm_cost_per_1m_output,
     )
+    attempts_df = outcome.attempts_df
+    results_df = outcome.results_df
 
     save_attack_progress(
         attempts_df=attempts_df,
@@ -3220,14 +3555,15 @@ def main() -> None:
         output_paths=output_paths,
     )
 
-    run_post_run_integrity_checks(
-        attempts_path=output_paths.attempts,
-        results_path=output_paths.results,
-        pool_df=pool_df,
-        experiment_split=args.pool,
-        max_classifier_queries=args.max_classifier_queries,
-        require_full_pool_size=args.max_examples is None,
-    )
+    if not outcome.spend_guard_triggered:
+        run_post_run_integrity_checks(
+            attempts_path=output_paths.attempts,
+            results_path=output_paths.results,
+            pool_df=pool_df,
+            experiment_split=args.pool,
+            max_classifier_queries=args.max_classifier_queries,
+            require_full_pool_size=args.max_examples is None,
+        )
 
     metadata = build_metadata(
         run_id=run_id,
@@ -3241,17 +3577,32 @@ def main() -> None:
         paraphraser=paraphraser,
         paraphraser_mode=args.paraphraser,
         output_paths=output_paths,
-        integrity_checks_passed=True,
+        integrity_checks_passed=not outcome.spend_guard_triggered,
         seed=args.seed,
         max_classifier_queries=args.max_classifier_queries,
         max_generation_attempts=args.max_generation_attempts,
         max_examples=args.max_examples,
         output_tag=args.output_tag,
+        max_spend_usd=args.max_spend_usd,
+        input_cost_per_1m=args.api_llm_cost_per_1m_input,
+        output_cost_per_1m=args.api_llm_cost_per_1m_output,
+        api_preflight_enabled=(
+            args.paraphraser == API_LLM_PARAPHRASER_MODE
+            and not args.skip_api_preflight
+        ),
+        spend_guard_triggered=outcome.spend_guard_triggered,
+        run_stop_reason=outcome.run_stop_reason,
     )
     with open(output_paths.metadata, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    logging.info("%s attack complete.", args.pool.capitalize())
+    if outcome.spend_guard_triggered:
+        logging.warning(
+            "%s attack paused by spend guard with progress and metadata saved.",
+            args.pool.capitalize(),
+        )
+    else:
+        logging.info("%s attack complete.", args.pool.capitalize())
     logging.info("Attempts saved to: %s", output_paths.attempts)
     logging.info("Results saved to:  %s", output_paths.results)
     logging.info("Metadata saved to: %s", output_paths.metadata)

@@ -157,6 +157,12 @@ def read_inputs() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
         "generation_seconds",
         "generated_token_count",
         "generation_tokens_per_second",
+        "prompt_token_count",
+        "completion_token_count",
+        "total_token_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
     ]
     for df in (results, attempts):
         for col in numeric_cols:
@@ -509,6 +515,122 @@ def runtime_summary(attempts: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def coalesced_numeric_series(
+    frame: pd.DataFrame,
+    columns: list[str],
+) -> pd.Series:
+    values = pd.Series(float("nan"), index=frame.index, dtype="float64")
+    for column in columns:
+        if column in frame.columns:
+            candidate = pd.to_numeric(frame[column], errors="coerce")
+            values = values.fillna(candidate)
+    return values
+
+
+def complete_numeric_total(values: pd.Series) -> int | Any:
+    if values.empty or values.isna().any():
+        return pd.NA
+    return int(values.sum())
+
+
+def token_cost_summary(
+    attempts: pd.DataFrame,
+    results: pd.DataFrame,
+    meta: dict[str, Any],
+) -> pd.DataFrame:
+    spend_meta = meta.get("spend_monitoring", {})
+    if not isinstance(spend_meta, dict):
+        spend_meta = {}
+    input_price = pd.to_numeric(
+        spend_meta.get("api_llm_cost_per_1m_input"),
+        errors="coerce",
+    )
+    output_price = pd.to_numeric(
+        spend_meta.get("api_llm_cost_per_1m_output"),
+        errors="coerce",
+    )
+
+    rows: list[dict[str, Any]] = []
+    grouped: list[tuple[str, pd.DataFrame]] = [("overall", attempts)]
+    grouped.extend(
+        (str(name), group)
+        for name, group in attempts.groupby("feedback_condition", sort=True)
+    )
+    for condition, group in grouped:
+        input_tokens = coalesced_numeric_series(
+            group,
+            ["prompt_token_count", "prompt_tokens"],
+        )
+        output_tokens = coalesced_numeric_series(
+            group,
+            [
+                "completion_token_count",
+                "completion_tokens",
+                "generated_token_count",
+            ],
+        )
+        recorded_total_tokens = coalesced_numeric_series(
+            group,
+            ["total_token_count", "total_tokens"],
+        )
+        seconds = (
+            pd.to_numeric(group["generation_seconds"], errors="coerce")
+            if "generation_seconds" in group.columns
+            else pd.Series(float("nan"), index=group.index, dtype="float64")
+        )
+
+        total_input_tokens = complete_numeric_total(input_tokens)
+        total_output_tokens = complete_numeric_total(output_tokens)
+        total_tokens = complete_numeric_total(recorded_total_tokens)
+        if (
+            pd.isna(total_tokens)
+            and not pd.isna(total_input_tokens)
+            and not pd.isna(total_output_tokens)
+        ):
+            total_tokens = int(total_input_tokens + total_output_tokens)
+
+        estimated_input_cost = (
+            float(total_input_tokens) / 1_000_000 * float(input_price)
+            if not pd.isna(total_input_tokens) and not pd.isna(input_price)
+            else float("nan")
+        )
+        estimated_output_cost = (
+            float(total_output_tokens) / 1_000_000 * float(output_price)
+            if not pd.isna(total_output_tokens) and not pd.isna(output_price)
+            else float("nan")
+        )
+        estimated_total_cost = (
+            estimated_input_cost + estimated_output_cost
+            if not math.isnan(estimated_input_cost)
+            and not math.isnan(estimated_output_cost)
+            else float("nan")
+        )
+
+        condition_results = (
+            results
+            if condition == "overall"
+            else results[results["feedback_condition"].astype(str) == condition]
+        )
+        rows.append(
+            {
+                "feedback_condition": condition,
+                "number_of_attempts": int(len(group)),
+                "number_of_completed_pairs": int(len(condition_results)),
+                "number_of_successes": int(condition_results["success"].sum()),
+                "total_input_tokens": total_input_tokens,
+                "total_output_tokens": total_output_tokens,
+                "total_tokens": total_tokens,
+                "estimated_input_cost_usd": estimated_input_cost,
+                "estimated_output_cost_usd": estimated_output_cost,
+                "estimated_total_cost_usd": estimated_total_cost,
+                "mean_generation_seconds": seconds.mean(),
+                "median_generation_seconds": seconds.median(),
+                "max_generation_seconds": seconds.max(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def representative_examples(results: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     success_cols = [
         "row_id",
@@ -628,6 +750,7 @@ def build_summary_json(
             "table_failed_checks": "table_failed_checks.csv",
             "table_stop_reasons": "table_stop_reasons.csv",
             "table_runtime_summary": "table_runtime_summary.csv",
+            "table_token_cost_summary": "table_token_cost_summary.csv",
             "representative_successes": "representative_successes.csv",
             "representative_failures": "representative_failures.csv",
         },
@@ -719,6 +842,7 @@ def main() -> None:
     failed_checks = failed_checks_table(attempts)
     stop_reasons = stop_reasons_table(results)
     runtime = runtime_summary(attempts)
+    token_cost = token_cost_summary(attempts, results, meta)
     successes, failures = representative_examples(results)
 
     tables = {
@@ -732,6 +856,7 @@ def main() -> None:
         "failed_checks": failed_checks,
         "stop_reasons": stop_reasons,
         "runtime": runtime,
+        "token_cost": token_cost,
         "successes": successes,
         "failures": failures,
     }
@@ -747,6 +872,7 @@ def main() -> None:
     save_csv(failed_checks, ANALYSIS_DIR / "table_failed_checks.csv")
     save_csv(stop_reasons, ANALYSIS_DIR / "table_stop_reasons.csv")
     save_csv(runtime, ANALYSIS_DIR / "table_runtime_summary.csv")
+    save_csv(token_cost, ANALYSIS_DIR / "table_token_cost_summary.csv")
     save_csv(successes, ANALYSIS_DIR / "representative_successes.csv")
     save_csv(failures, ANALYSIS_DIR / "representative_failures.csv")
 
