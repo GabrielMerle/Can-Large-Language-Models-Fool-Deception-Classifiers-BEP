@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # File-level purpose:
-# - first end-to-end pilot attack loop
+# - end-to-end attack loop (sequential or parallel via --num-workers)
 # - connects frozen pilot pool, classifier wrapper, validity checker, and a
 #   modular paraphrase generator placeholder
 # - keeps query-budget accounting separate from original prediction verification
@@ -14,11 +14,13 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -1736,6 +1738,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional row limit for tiny smoke tests. Uses the first N sorted pilot rows.",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel attack workers. Each worker thread gets its own "
+            "classifier, validity checker, and paraphraser instance, and each "
+            "(row_id, feedback_condition) pair is fully independent, so results "
+            "are identical to a sequential run. Default: 1 (sequential)."
+        ),
+    )
+    parser.add_argument(
         "--max-classifier-queries",
         type=int,
         default=MAX_CLASSIFIER_QUERIES,
@@ -2016,6 +2029,14 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.max_examples is not None and args.max_examples <= 0:
         raise ValueError("--max-examples must be positive when provided.")
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be at least 1.")
+    if args.num_workers > 8:
+        raise ValueError(
+            "--num-workers above 8 is not supported (memory pressure and "
+            "diminishing returns; each worker loads its own classifier and "
+            "validity checker)."
+        )
     if args.max_classifier_queries <= 0:
         raise ValueError("--max-classifier-queries must be positive.")
     if args.max_generation_attempts <= 0:
@@ -2950,6 +2971,212 @@ def run_single_attack(
     return attempt_rows, result_row
 
 
+def sort_frames_canonically(
+    attempts_df: pd.DataFrame,
+    results_df: pd.DataFrame,
+    pilot_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Sort output frames into the same (pool order, condition order) sequence
+    that a sequential run produces, so parallel runs yield identical files."""
+    row_order = {
+        int(row_id): position
+        for position, row_id in enumerate(pilot_df[ROW_ID_COLUMN].astype(int))
+    }
+    condition_order = {
+        condition: position for position, condition in enumerate(FEEDBACK_CONDITIONS)
+    }
+
+    def sort_one(df: pd.DataFrame, extra_keys: list[str]) -> pd.DataFrame:
+        if df.empty:
+            return df.reset_index(drop=True)
+        sort_keys = ["_row_order", "_condition_order", *extra_keys]
+        sorted_df = (
+            df.assign(
+                _row_order=df[ROW_ID_COLUMN].astype(int).map(row_order),
+                _condition_order=df["feedback_condition"].map(condition_order),
+            )
+            .sort_values(sort_keys, kind="stable")
+            .drop(columns=["_row_order", "_condition_order"])
+            .reset_index(drop=True)
+        )
+        return sorted_df
+
+    sorted_attempts = sort_one(
+        attempts_df,
+        ["attempt_index"] if "attempt_index" in attempts_df.columns else [],
+    )
+    sorted_results = sort_one(results_df, [])
+    return sorted_attempts, sorted_results
+
+
+def run_attack_pairs_parallel(
+    pilot_df: pd.DataFrame,
+    run_id: str,
+    worker_resources_factory: Callable[[], tuple[Any, Any, Paraphraser]],
+    num_workers: int,
+    max_classifier_queries: int,
+    max_generation_attempts: int,
+    attempts_df: pd.DataFrame,
+    results_df: pd.DataFrame,
+    completed: set[tuple[int, str]],
+    output_paths: OutputPaths | None,
+    started_at: float,
+    initial_completed_pairs: int,
+    total_pairs: int,
+    max_spend_usd: float | None,
+    input_cost_per_1m: float,
+    output_cost_per_1m: float,
+) -> AttackRunOutcome:
+    """Parallel attack execution.
+
+    Worker threads only run independent (row_id, condition) pairs with their
+    own thread-local classifier/validity-checker/paraphraser instances. All
+    dataframe appends, checkpoint saves, and spend-guard checks happen in the
+    main thread, so no shared mutable state crosses threads (apart from the
+    stop event). Output files are canonically re-sorted at the end so they are
+    identical in ordering to a sequential run.
+    """
+    pending_pairs = [
+        (row, condition)
+        for _, row in pilot_df.iterrows()
+        for condition in FEEDBACK_CONDITIONS
+        if (int(row[ROW_ID_COLUMN]), condition) not in completed
+    ]
+    stop_event = threading.Event()
+    thread_resources = threading.local()
+    resource_init_lock = threading.Lock()
+
+    def attack_pair(
+        row: pd.Series,
+        feedback_condition: str,
+    ) -> tuple[list[dict[str, object]], dict[str, object]] | None:
+        if stop_event.is_set():
+            return None
+        if not hasattr(thread_resources, "classifier"):
+            # Serialize model loading: avoids a thundering herd of model
+            # initializations and keeps peak memory predictable.
+            with resource_init_lock:
+                logging.info(
+                    "Initializing worker resources | thread=%s",
+                    threading.current_thread().name,
+                )
+                (
+                    thread_resources.classifier,
+                    thread_resources.validity_checker,
+                    thread_resources.paraphraser,
+                ) = worker_resources_factory()
+        return run_single_attack(
+            row=row,
+            feedback_condition=feedback_condition,
+            run_id=run_id,
+            classifier=thread_resources.classifier,
+            validity_checker=thread_resources.validity_checker,
+            paraphraser=thread_resources.paraphraser,
+            max_classifier_queries=max_classifier_queries,
+            max_generation_attempts=max_generation_attempts,
+        )
+
+    spend_guard_triggered = False
+    estimated_cost: float | None = None
+
+    with ThreadPoolExecutor(
+        max_workers=num_workers,
+        thread_name_prefix="attack_worker",
+    ) as executor:
+        futures = {
+            executor.submit(attack_pair, row, condition): (
+                int(row[ROW_ID_COLUMN]),
+                condition,
+            )
+            for row, condition in pending_pairs
+        }
+        try:
+            for future in as_completed(futures):
+                pair_outcome = future.result()
+                if pair_outcome is None:
+                    # Pair was skipped because the stop event was already set.
+                    continue
+                attempt_rows, result_row = pair_outcome
+                if attempt_rows:
+                    attempts_df = pd.concat(
+                        [attempts_df, pd.DataFrame(attempt_rows, columns=ATTEMPT_COLUMNS)],
+                        ignore_index=True,
+                    )
+                results_df = pd.concat(
+                    [results_df, pd.DataFrame([result_row], columns=RESULT_COLUMNS)],
+                    ignore_index=True,
+                )
+                completed.add(futures[future])
+
+                if output_paths is not None:
+                    save_attack_progress(
+                        attempts_df=attempts_df,
+                        results_df=results_df,
+                        output_paths=output_paths,
+                    )
+                    logging.info(
+                        "Saved progress | completed_pairs=%s",
+                        len(completed),
+                    )
+
+                estimated_cost = log_attack_progress(
+                    attempts_df=attempts_df,
+                    results_df=results_df,
+                    completed_pairs=len(completed),
+                    total_pairs=total_pairs,
+                    newly_completed_pairs=len(completed) - initial_completed_pairs,
+                    started_at=started_at,
+                    input_cost_per_1m=input_cost_per_1m,
+                    output_cost_per_1m=output_cost_per_1m,
+                )
+                if (
+                    not spend_guard_triggered
+                    and len(completed) < total_pairs
+                    and max_spend_usd is not None
+                    and estimated_cost is not None
+                    and estimated_cost >= max_spend_usd
+                ):
+                    spend_guard_triggered = True
+                    stop_event.set()
+                    logging.warning(
+                        "Spend guard triggered. Estimated cost $%.4f meets or "
+                        "exceeds limit $%.4f. No new pairs will start; pairs "
+                        "already in flight are collected so their cost is not "
+                        "wasted. Progress saved. Re-run with a higher limit "
+                        "and --resume to continue.",
+                        estimated_cost,
+                        max_spend_usd,
+                    )
+        except Exception:
+            # Stop remaining pairs from starting, keep checkpointed progress.
+            stop_event.set()
+            raise
+
+    attempts_df, results_df = sort_frames_canonically(
+        attempts_df, results_df, pilot_df
+    )
+    if output_paths is not None:
+        save_attack_progress(
+            attempts_df=attempts_df,
+            results_df=results_df,
+            output_paths=output_paths,
+        )
+
+    if estimated_cost is None:
+        _, _, estimated_cost = estimate_api_cost_usd(
+            attempts_df,
+            input_cost_per_1m=input_cost_per_1m,
+            output_cost_per_1m=output_cost_per_1m,
+        )
+    return AttackRunOutcome(
+        attempts_df=attempts_df,
+        results_df=results_df,
+        spend_guard_triggered=spend_guard_triggered,
+        estimated_cost_usd=estimated_cost,
+        run_stop_reason="spend_guard" if spend_guard_triggered else "completed",
+    )
+
+
 def run_pilot_attack(
     pilot_df: pd.DataFrame,
     run_id: str,
@@ -2965,6 +3192,8 @@ def run_pilot_attack(
     max_spend_usd: float | None = None,
     input_cost_per_1m: float = DEFAULT_API_LLM_COST_PER_1M_INPUT,
     output_cost_per_1m: float = DEFAULT_API_LLM_COST_PER_1M_OUTPUT,
+    num_workers: int = 1,
+    worker_resources_factory: Callable[[], tuple[Any, Any, Paraphraser]] | None = None,
 ) -> AttackRunOutcome:
     attempts_df = (
         existing_attempts_df.copy()
@@ -3014,6 +3243,35 @@ def run_pilot_attack(
             spend_guard_triggered=True,
             estimated_cost_usd=initial_estimated_cost,
             run_stop_reason="spend_guard",
+        )
+
+    if num_workers > 1:
+        if worker_resources_factory is None:
+            raise ValueError(
+                "num_workers > 1 requires a worker_resources_factory."
+            )
+        logging.info(
+            "Running attack pairs in parallel | num_workers=%s | pending_pairs=%s",
+            num_workers,
+            total_pairs - len(completed),
+        )
+        return run_attack_pairs_parallel(
+            pilot_df=pilot_df,
+            run_id=run_id,
+            worker_resources_factory=worker_resources_factory,
+            num_workers=num_workers,
+            max_classifier_queries=max_classifier_queries,
+            max_generation_attempts=max_generation_attempts,
+            attempts_df=attempts_df,
+            results_df=results_df,
+            completed=completed,
+            output_paths=output_paths,
+            started_at=started_at,
+            initial_completed_pairs=initial_completed_pairs,
+            total_pairs=total_pairs,
+            max_spend_usd=max_spend_usd,
+            input_cost_per_1m=input_cost_per_1m,
+            output_cost_per_1m=output_cost_per_1m,
         )
 
     for _, row in pilot_df.iterrows():
@@ -3530,6 +3788,19 @@ def main() -> None:
     logging.info("Loading validity checker.")
     validity_checker = ParaphraseValidityChecker()
 
+    def worker_resources_factory() -> tuple[Any, Any, Paraphraser]:
+        """Fresh classifier/validity-checker/paraphraser per worker thread.
+
+        Paraphraser instances keep per-call state (last generation runtime),
+        and the classifier tracks per-attack query counts, so instances must
+        never be shared across worker threads.
+        """
+        return (
+            DeceptionClassifierWrapper(),
+            ParaphraseValidityChecker(),
+            build_paraphraser(args),
+        )
+
     outcome = run_pilot_attack(
         pilot_df=pool_df,
         run_id=run_id,
@@ -3545,6 +3816,8 @@ def main() -> None:
         max_spend_usd=args.max_spend_usd,
         input_cost_per_1m=args.api_llm_cost_per_1m_input,
         output_cost_per_1m=args.api_llm_cost_per_1m_output,
+        num_workers=args.num_workers,
+        worker_resources_factory=worker_resources_factory,
     )
     attempts_df = outcome.attempts_df
     results_df = outcome.results_df
