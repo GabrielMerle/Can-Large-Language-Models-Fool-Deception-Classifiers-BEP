@@ -19,6 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
@@ -1472,7 +1473,13 @@ class ApiLLMParaphraser:
                 )
                 time.sleep(min(2**attempt, 5))
                 continue
-            except (URLError, TimeoutError) as exc:
+            except (
+                URLError,
+                TimeoutError,
+                RemoteDisconnected,
+                ConnectionError,
+                IncompleteRead,
+            ) as exc:
                 if attempt >= self.max_retries:
                     raise RuntimeError(
                         "API generation request failed after retryable network errors."
@@ -1489,9 +1496,35 @@ class ApiLLMParaphraser:
             try:
                 decoded = json.loads(raw)
             except json.JSONDecodeError as exc:
-                raise RuntimeError("API generation response was not valid JSON.") from exc
+                if attempt >= self.max_retries:
+                    raise RuntimeError(
+                        "API generation response was not valid JSON."
+                    ) from exc
+                logging.warning(
+                    "API generation response was not valid JSON (likely a "
+                    "truncated response); retrying (%s/%s).",
+                    attempt + 1,
+                    self.max_retries,
+                )
+                time.sleep(min(2**attempt, 5))
+                continue
             if not isinstance(decoded, dict):
                 raise RuntimeError("API generation response had an unexpected JSON shape.")
+            choices = decoded.get("choices")
+            if not isinstance(choices, list) or not choices:
+                if attempt >= self.max_retries:
+                    raise RuntimeError(
+                        "API generation response did not include usable choices "
+                        f"after retries. Response keys: {sorted(decoded.keys())}"
+                    )
+                logging.warning(
+                    "API generation response had no usable choices "
+                    "(possible gateway error with HTTP 200); retrying (%s/%s).",
+                    attempt + 1,
+                    self.max_retries,
+                )
+                time.sleep(min(2**attempt, 5))
+                continue
             return decoded
 
         raise RuntimeError("API generation request failed unexpectedly.")
@@ -2426,8 +2459,16 @@ def save_attack_progress(
         raise ValueError(
             "Refusing to save duplicate completed (row_id, feedback_condition) pairs."
         )
-    attempts_df.to_csv(output_paths.attempts, index=False)
-    results_df.to_csv(output_paths.results, index=False)
+    # Atomic writes: write to a temp file then os.replace, so an interrupted
+    # save (Ctrl+C, crash, power loss) can never leave a truncated checkpoint
+    # that would break --resume.
+    for frame, path in (
+        (attempts_df, output_paths.attempts),
+        (results_df, output_paths.results),
+    ):
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        frame.to_csv(temp_path, index=False)
+        os.replace(temp_path, path)
 
 
 def coalesced_numeric_series(
