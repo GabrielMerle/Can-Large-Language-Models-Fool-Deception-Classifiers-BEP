@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "Scripts_code" / "outputs"
 MAIN_ANALYSIS_NAME = "main_gen3_query3"
 EXPLORATORY_ANALYSIS_NAME = "exploratory_remaining_gen3_query3"
+UNIFIED_ANALYSIS_NAME = "unified_llama70b_gen5_query5"
 
 ANALYSIS_NAME = MAIN_ANALYSIS_NAME
 ANALYSIS_DIR = OUTPUT_DIR / "analysis_main_gen3_query3"
@@ -63,6 +64,21 @@ ANALYSIS_CONFIGS = {
         "expected_input_pool_rows": 229,
         "expected_budget_config": "gen3_query3",
         "expected_prompt_version": EXPECTED_PROMPT_VERSION,
+    },
+    UNIFIED_ANALYSIS_NAME: {
+        "analysis_dir": OUTPUT_DIR / "analysis_unified_llama70b_gen5_query5",
+        "results_path": OUTPUT_DIR
+        / "attack_results_unified_api_llm_llama70b_gen5_query5.csv",
+        "attempts_path": OUTPUT_DIR
+        / "attack_attempts_unified_api_llm_llama70b_gen5_query5.csv",
+        "meta_path": OUTPUT_DIR
+        / "attack_unified_meta_api_llm_llama70b_gen5_query5.json",
+        "expected_result_rows": 778,
+        "expected_unique_row_ids": 389,
+        "expected_split": "unified",
+        "expected_input_pool_rows": 389,
+        "expected_budget_config": "gen5_query5",
+        "expected_prompt_version": "qwen3_paraphrase_feedback_v2_conservative",
     },
 }
 
