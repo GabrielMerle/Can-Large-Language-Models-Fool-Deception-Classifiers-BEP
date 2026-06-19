@@ -23,6 +23,10 @@ ENV/
 # =========================
 Scripts_code/outputs/*
 !Scripts_code/outputs/.gitkeep
+outputs/*
+!outputs/.gitkeep
+attack_attempts*
+attack_results*
 *.log
 
 # =========================
@@ -45,6 +49,13 @@ Automated Deception Classifier (Projectfolder)/
 *.onnx
 *.gguf
 *.ckpt
+*.h5
+*.hdf5
+
+# Model directories
+models/
+model_weights/
+checkpoints/
 
 # Hugging Face / model caches
 .cache/
@@ -59,6 +70,48 @@ CACHEDIR.TAG
 *.zip
 Research_papers_to_use/
 Relatedwork/
+
+# Thesis sources and LaTeX build artifacts
+main_unified*.tex
+main_unified*.bib
+references_updated_*.bib
+thesis_*.tex
+*.aux
+*.toc
+*.out
+*.bbl
+*.blg
+*.synctex.gz
+thesis_figures/
+thesis_tables/
+
+# Planning, audits, session logs, working spreadsheets
+BEP_*.md
+S1_*.md
+S6_*.md
+S7_*.md
+session_summary_*.md
+supervisor_feedback_*.md
+Citation_Plagiarism_Audit*.md
+analysis_report_*.md
+*.xlsx
+GITHUB_CLEANUP_PLAN.md
+primary_main_results_record.md
+exploratory_results_record.md
+
+# Thesis-writing working docs under docs/
+docs/PROJECT_STATUS.md
+docs/THESIS_*.md
+docs/THESIS_*.tex
+docs/RELATED_WORK_ASR_COMPARISON.md
+docs/RESULTS_TABLES_FOR_THESIS.md
+
+# Local secrets
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.json
 
 # =========================
 # OS/editor files
