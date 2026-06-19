@@ -1,166 +1,70 @@
 # Local Artifacts
 
-This repository intentionally excludes local datasets, model weights, generated outputs, research papers, and thesis drafts.
+This repository intentionally contains code, documentation, and aggregate
+results only. Data, model weights, raw outputs, generated text, and credentials
+remain local because they may be large, licensed, private, or unsuitable for
+normal Git history.
 
-The code expects several files to exist locally. They are not included in Git because they may be large, private, licensed, copyrighted, or reproducible from scripts.
+## Expected local paths
 
----
-
-## Required Local Folder Structure
-
-Place this folder in the repository root:
+The current scripts expect this directory in the repository root:
 
 ```text
 Automated Deception Classifier (Projectfolder)/
-├── hippocorpus_training_truncated.csv
-├── hippocorpus_test_truncated.csv
-├── hippocorpus_train_set.csv                    # optional historical/source file
-├── hippocorpus_test_set.csv                     # optional historical/source file
-├── DistilBERT/
-│   ├── config.json
-│   ├── model.safetensors
-│   ├── special_tokens_map.json
-│   ├── tokenizer.json
-│   ├── tokenizer_config.json
-│   └── vocab.txt
-└── local_models/
-    ├── all-MiniLM-L6-v2/
-    │   ├── config.json
-    │   ├── model.safetensors
-    │   ├── tokenizer.json
-    │   └── tokenizer_config.json
-    ├── Qwen3-4B-Instruct-2507/
-    │   ├── config.json
-    │   ├── model-00001-of-00003.safetensors
-    │   ├── model-00002-of-00003.safetensors
-    │   ├── model-00003-of-00003.safetensors
-    │   ├── model.safetensors.index.json
-    │   ├── tokenizer.json
-    │   ├── tokenizer_config.json
-    │   ├── vocab.json
-    │   └── merges.txt
-    └── Qwen3-4B-Instruct-2507-GGUF/
-        └── Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+|-- hippocorpus_training_truncated.csv
+|-- hippocorpus_test_truncated.csv
+|-- DistilBERT/
+`-- local_models/
+    |-- all-MiniLM-L6-v2/
+    |-- Qwen3-4B-Instruct-2507/          # historical local workflow
+    `-- Qwen3-4B-Instruct-2507-GGUF/     # historical local workflow
 ```
 
-Only the truncated Hippocorpus files are used by the current pipeline:
+The final experiment uses the held-out Hippocorpus pool derived from the
+truncated test file, the fixed local DistilBERT classifier, and the local SBERT
+model used by the validity gate. Do not change these paths unless the code and
+documentation are updated together.
+
+Generated files are written beneath:
 
 ```text
-hippocorpus_training_truncated.csv
-hippocorpus_test_truncated.csv
+Scripts_code/outputs/
 ```
 
-The canonical attacked/model-input column is:
+Only `Scripts_code/outputs/.gitkeep` is tracked.
 
-```text
-text_truncated
-```
+## What is not committed
 
-The pipeline stores this internally as:
+- Hippocorpus CSVs, including source text and labels.
+- The fixed DistilBERT model folder and weight files.
+- The frozen SBERT model folder and weight files.
+- Llama or other local model weights, including GGUF and safetensors files.
+- DeepInfra-hosted Llama weights; the API-served model is referenced by name
+  only and no provider weights are stored locally.
+- Raw attack attempts/results, generated paraphrases, metadata, diagnostics,
+  and derived analysis files.
+- PDFs, DOCX files, ZIP archives, thesis source/build files, working notes, and
+  spreadsheets.
+- API keys, `.env` files, credentials, passwords, and tokens.
 
-```text
-attack_text
-```
+## Model helpers
 
----
-
-## Why These Files Are Not Committed
-
-### Dataset CSVs
-
-Dataset files may have licensing, privacy, or redistribution restrictions. They should stay local unless redistribution is explicitly allowed.
-
-### DistilBERT model folder
-
-The victim classifier folder contains model weights. These files are large and should not be stored in normal Git history.
-
-### Local SBERT model folder
-
-The validity checker uses a frozen local SBERT model for semantic similarity. This makes normal runs reproducible and avoids unexpected online downloads, but the model files should still remain local.
-
-### Qwen Transformers folder
-
-The local Qwen model is multi-GB and should not be committed.
-
-### Qwen GGUF folder
-
-The GGUF file is a large local inference artifact for llama.cpp. It should not be committed.
-
-### Generated outputs
-
-Files in `Scripts_code/outputs/` are generated artifacts. They should be reproducible from the scripts and local artifacts.
-
-### Papers and thesis drafts
-
-Research-paper PDFs, thesis drafts, proposal documents, and feedback forms are not source code and may contain copyrighted or private material.
-
----
-
-## Recreating Local Models
-
-### Freeze SBERT
-
-Run this once when the local SBERT folder is missing:
+If the local SBERT folder is missing:
 
 ```powershell
 python Scripts_code\freeze_sbert_model.py
 ```
 
-This creates:
+`freeze_local_llm_model.py` supports the earlier local Qwen workflow retained
+for provenance. It is not required for the final DeepInfra-served 70B run.
 
-```text
-Automated Deception Classifier (Projectfolder)/local_models/all-MiniLM-L6-v2/
-```
+## Credential handling
 
-### Freeze Qwen Transformers model
-
-Run this once when the local Qwen Transformers folder is missing:
+Set the provider key only in the process environment:
 
 ```powershell
-python Scripts_code\freeze_local_llm_model.py
+$env:DEEPINFRA_API_KEY = "your-key-here"
 ```
 
-This creates:
-
-```text
-Automated Deception Classifier (Projectfolder)/local_models/Qwen3-4B-Instruct-2507/
-```
-
-This command requires internet access and enough disk space.
-
-### GGUF model
-
-The GGUF file must be downloaded or placed manually:
-
-```text
-Automated Deception Classifier (Projectfolder)/local_models/Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
-```
-
-The repo stores only the expected path and run documentation, not the GGUF file itself.
-
----
-
-## Generated Outputs
-
-The following are created by the scripts and ignored by Git:
-
-```text
-Scripts_code/outputs/baseline_predictions_train_dev.csv
-Scripts_code/outputs/candidate_pool_train_dev.csv
-Scripts_code/outputs/baseline_summary_train_dev.json
-Scripts_code/outputs/baseline_predictions_test_final.csv
-Scripts_code/outputs/candidate_pool_test_final.csv
-Scripts_code/outputs/baseline_summary_test_final.json
-Scripts_code/outputs/candidate_pool_pilot_20.csv
-Scripts_code/outputs/candidate_pool_main_160.csv
-Scripts_code/outputs/candidate_pool_freeze_meta.json
-Scripts_code/outputs/attack_attempts_pilot_<mode>.csv
-Scripts_code/outputs/attack_results_pilot_<mode>.csv
-Scripts_code/outputs/attack_pilot_meta_<mode>.json
-```
-
-The only file committed inside `Scripts_code/outputs/` should be:
-
-```text
-Scripts_code/outputs/.gitkeep
-```
+The attack runner receives only the environment-variable name through
+`--api-llm-key-env`. Never store the value in tracked files or raw outputs.

@@ -1,225 +1,92 @@
-# Reproducibility Notes
+# Reproducibility
 
-This project is designed as a controlled robustness evaluation. The goal is to isolate the effect of classifier feedback granularity, not to compare many classifiers, many LLMs, or many attack settings at once.
+## Frozen final design
 
----
+The final study is a paired, controlled black-box comparison:
 
-## Experimental Control
+- fixed pretrained DistilBERT victim classifier;
+- Hippocorpus truthful/deceptive task;
+- 389 correctly classified held-out examples (170 truthful, 219 deceptive);
+- each example attacked once with `label_only` feedback and once with
+  `score_based` feedback;
+- 778 total attack runs;
+- `meta-llama/Llama-3.3-70B-Instruct-Turbo` served through DeepInfra;
+- seed 42;
+- temperature 0.45, `top_p` 0.85, maximum 220 completion tokens;
+- `gen5_query5`: at most five generation attempts and five valid classifier
+  queries per example and condition.
 
-The comparison has two feedback conditions:
+The paraphraser is correctly described as a 70B-class open-weight
+instruction-tuned model served through an API, not as a fully local model.
 
-1. `label_only`
-2. `score_based`
+## Controlled comparison
 
-Everything else should remain fixed across conditions:
+The following are held fixed across feedback conditions:
 
-- same victim classifier;
-- same attacked examples;
-- same canonical input column;
-- same paraphraser model/backend;
-- same prompt version;
-- same generation settings;
-- same validity checker;
-- same semantic-similarity threshold;
-- same classifier-query budget;
-- same success definition;
-- same logging schema.
+- victim classifier and inference path;
+- attacked examples and ordering-independent row/condition tasks;
+- paraphraser model and provider;
+- prompt family and generation settings;
+- validity checker and thresholds;
+- generation and classifier-query budgets;
+- success definition and stopping rules;
+- logging schema.
 
-The only intended difference is whether the attacker receives only the predicted label or the predicted label plus confidence.
+Only the feedback differs: the predicted label alone, or the predicted label
+plus confidence.
 
----
+## Eligibility and success
 
-## Data Split Policy
+Only examples correctly classified by the victim on the held-out split enter
+the attack pool. An attack succeeds only if:
 
-The pipeline separates development/pilot work from final evaluation.
+1. the generated paraphrase passes every required validity check;
+2. the victim prediction flips;
+3. the flip occurs within the fixed budget.
 
-```text
-hippocorpus_training_truncated.csv -> train/dev side
-hippocorpus_test_truncated.csv     -> final test side
+The original-text verification is separate from the attack query budget.
+Invalid candidates are logged but never queried.
+
+## Validity gate
+
+The shared gate includes:
+
+- SBERT cosine similarity of at least 0.86;
+- minimum length-ratio and basic text-quality checks;
+- non-identical and duplicate handling;
+- number consistency;
+- date consistency;
+- negation consistency.
+
+The same gate is applied before victim inference in both conditions.
+
+## Reproducing derived results
+
+Place the frozen raw output files in `Scripts_code/outputs/`, then run:
+
+```powershell
+python Scripts_code\07_analysis_results.py `
+  --analysis unified_llama70b_gen5_query5
 ```
 
-The pilot pool is sampled from train/dev data.
+This analysis is read-only with respect to the raw result, attempt, and
+metadata files. Optional final figures are generated with:
 
-The main pool is sampled from final test data.
-
-The final test side should not be used for prompt tuning, threshold tuning, or debugging decisions after the protocol is frozen.
-
----
-
-## Canonical Text Field
-
-The canonical model/attack input is:
-
-```text
-text_truncated
+```powershell
+python Scripts_code\09_unified_figures.py
 ```
 
-The pipeline stores this as:
+Aggregate results are recorded in the repository-level `RESULTS.md`; raw text,
+candidate paraphrases, and run outputs remain local.
 
-```text
-attack_text
-```
+## Provenance and limitations
 
-This avoids attacking a text field that differs from what the victim classifier actually sees.
+Reproduction requires access to the Hippocorpus files, the fixed victim model,
+the frozen SBERT validity model, and a compatible API endpoint/model. Provider
+infrastructure can introduce operational variation even when model name,
+prompt, seed, and sampling settings are fixed. Preserve the run metadata and
+file hashes produced by the scripts when conducting a new run.
 
----
-
-## Candidate Pool Policy
-
-Only examples that the victim classifier originally classifies correctly are eligible for attack.
-
-This prevents already-misclassified items from being counted as adversarial robustness failures.
-
-Candidate pools are deduplicated by a stable hash of the attacked text where supported by the script metadata.
-
----
-
-## Frozen Attack Pools
-
-The project uses two frozen attacked subsets:
-
-```text
-candidate_pool_pilot_20.csv
-candidate_pool_main_160.csv
-```
-
-The pilot set is for debugging and protocol stabilization.
-
-The main set is for the final paired comparison.
-
-These files are generated outputs and are not committed to Git. Their creation metadata is written to:
-
-```text
-candidate_pool_freeze_meta.json
-```
-
----
-
-## Query Accounting
-
-The original-text verification query is logged separately.
-
-The attack budget applies only to candidate classifier queries inside the attack loop.
-
-Invalid candidates are logged but are not queried against the classifier.
-
-This matters because the project measures query efficiency as part of the robustness comparison.
-
----
-
-## Validity Checking
-
-The validity checker decides whether a generated paraphrase is eligible to be considered an adversarial candidate.
-
-It does not decide attack success.
-
-A candidate must pass:
-
-- basic quality checks;
-- non-identical check;
-- minimum token/length checks;
-- SBERT semantic similarity;
-- lightweight number/date/negation consistency checks.
-
-Current semantic similarity threshold:
-
-```text
-SBERT cosine similarity >= 0.86
-```
-
-This threshold should be kept fixed once the final protocol is frozen.
-
----
-
-## Success Definition
-
-A successful attack requires all of the following:
-
-1. the original item was correctly classified;
-2. the candidate paraphrase is valid;
-3. the classifier prediction flips;
-4. the flip occurs within the fixed classifier-query budget.
-
-A raw prediction flip is not enough if the paraphrase fails validity checks.
-
----
-
-## Local Models
-
-The project uses local model folders for reproducibility and privacy.
-
-Expected local models:
-
-```text
-DistilBERT/                       # fixed victim classifier
-local_models/all-MiniLM-L6-v2/    # SBERT validity model
-local_models/Qwen3-4B-Instruct-2507/
-local_models/Qwen3-4B-Instruct-2507-GGUF/
-```
-
-These are not committed to Git.
-
-For final runs, record:
-
-- victim model path/hash where available;
-- SBERT model path/hash where available;
-- Qwen model id;
-- GGUF filename;
-- GGUF file hash;
-- backend type;
-- llama.cpp version/build if using llama.cpp;
-- context size;
-- GPU offload setting;
-- generation settings;
-- prompt version and prompt hash.
-
----
-
-## Output Metadata
-
-The scripts are expected to write metadata JSON files for generated outputs.
-
-Metadata should make it possible to reconstruct:
-
-- input paths;
-- output paths;
-- row counts;
-- hashes;
-- split provenance;
-- seed values;
-- model/backend settings;
-- validity-check settings;
-- query-budget settings;
-- prompt settings;
-- integrity-check status.
-
-Do not manually edit generated metadata files.
-
----
-
-## Overwrite Policy
-
-Scripts should refuse to overwrite important outputs unless `--overwrite` is explicitly provided.
-
-Use `--overwrite` only when the output is intentionally being regenerated.
-
-For final/paper/thesis runs, avoid overwriting previous run outputs unless the older run has been backed up or is known to be invalid.
-
----
-
-## What Not to Change Between Conditions
-
-Do not change these separately for `label_only` and `score_based`:
-
-- attacked examples;
-- prompt version, except the feedback block;
-- paraphraser model;
-- paraphraser backend;
-- temperature/top-p/top-k settings;
-- max tokens;
-- classifier-query budget;
-- validity thresholds;
-- semantic model;
-- stopping rules.
-
-Changing any of these differently across conditions would make the comparison harder to interpret.
+Earlier `main_gen3_query3` and `exploratory_remaining_gen3_query3`
+configurations remain in some scripts for provenance. They are not the final
+thesis-relevant experiment.
