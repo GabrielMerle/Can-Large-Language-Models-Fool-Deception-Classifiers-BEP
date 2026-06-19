@@ -1,92 +1,89 @@
-# LLM Paraphrase Attacks on a Deception Classifier
+# Can Large Language Models Fool Deception Classifiers? A Controlled Black-Box Study of Feedback Granularity in Semantic-Preserving Paraphrase Attacks
 
-This repository contains the implementation for a Bachelor End Project on testing whether meaning-preserving LLM paraphrases can fool a fixed text-based deception classifier.
+Research code for a controlled black-box study of feedback granularity in
+semantic-preserving paraphrase attacks.
 
-The project is a controlled black-box robustness study. It does **not** train a new deception classifier. Instead, it evaluates a fixed pretrained DistilBERT deception classifier under two feedback settings:
+The project asks whether a strong instruction-tuned language model can fool a
+fixed deception classifier by paraphrasing its input without changing its
+meaning, and whether exposing classifier confidence improves the attack over
+label-only feedback.
 
-1. **Label-only feedback**: the attacker receives only the predicted class.
-2. **Score-based feedback**: the attacker receives the predicted class plus the predicted-class confidence.
+## Final experiment
 
-The intended experimental comparison keeps the victim classifier, attacked examples, paraphrase-generation setup, validity checker, budgets, success definition, and logging fixed. The main variable is the amount of classifier feedback exposed to the attack loop.
+- Victim: fixed pretrained DistilBERT deception classifier.
+- Data: Hippocorpus truthful/deceptive text task.
+- Attack pool: 389 correctly classified held-out examples (170 truthful and
+  219 deceptive).
+- Design: every example was attacked under both feedback conditions, for 778
+  paired attack runs.
+- Paraphraser: `meta-llama/Llama-3.3-70B-Instruct-Turbo`, a 70B-class
+  open-weight instruction-tuned model served through the DeepInfra API.
+- Budget: `gen5_query5` (at most five generation attempts and five valid
+  classifier queries per example and condition).
+- Success: a candidate must pass the validity gate and flip the classifier
+  prediction within budget.
 
----
+The two conditions differ only in the feedback returned to the paraphraser:
 
-## Repository Status
+1. `label_only`: predicted class only.
+2. `score_based`: predicted class and predicted-class confidence.
 
-Implemented:
+Invalid candidates are logged but never submitted to the victim classifier.
+The shared validity gate applies an SBERT cosine-similarity threshold of 0.86,
+length-ratio and basic-quality checks, number/date/negation consistency checks,
+and duplicate handling.
 
-- baseline inference on train/dev and final test splits;
-- construction of candidate pools from examples originally classified correctly;
-- frozen pilot and main attack pools;
-- a controlled victim-model wrapper with two feedback modes;
-- a shared semantic-preservation validity checker;
-- local SBERT freezing helper;
-- local Qwen paraphraser freezing helper;
-- pilot attack loop with placeholder, invalid-debug, Transformers local LLM, and llama.cpp server local LLM modes;
-- attempt-level, result-level, and metadata logging.
+## Headline results
 
-Not yet implemented:
+| Feedback | Successes | N | Valid ASR |
+| --- | ---: | ---: | ---: |
+| Label-only | 97 | 389 | 24.9% |
+| Score-based | 90 | 389 | 23.1% |
 
-- final main-experiment script;
-- final analysis/statistical comparison script;
-- final results tables and thesis-ready figures.
+The exact McNemar test gave `p = .296`. Overall, 2,573 of 3,285 generated
+candidates were valid (78.3%), and zero invalid candidates were queried.
+Exposing confidence did not improve attack success or query efficiency under
+the fixed low-budget protocol. See [RESULTS.md](RESULTS.md) for the full
+summary.
 
----
-
-## Repository Layout
+## Repository layout
 
 ```text
 .
-├── README.md
-├── requirements.txt
-├── docs/
-│   ├── LOCAL_ARTIFACTS.md
-│   ├── RUNNING.md
-│   └── REPRODUCIBILITY.md
-└── Scripts_code/
-    ├── 01_baseline_inference.py
-    ├── 02_make_attack_pool.py
-    ├── 03_classifier_wrapper.py
-    ├── 04_validity_checks.py
-    ├── 05_attack_pilot.py
-    ├── freeze_sbert_model.py
-    ├── freeze_local_llm_model.py
-    └── outputs/
-        └── .gitkeep
+|-- README.md
+|-- RESULTS.md
+|-- requirements.txt
+|-- .gitignore
+|-- docs/
+|   |-- RUNNING.md
+|   |-- REPRODUCIBILITY.md
+|   `-- LOCAL_ARTIFACTS.md
+`-- Scripts_code/
+    |-- 01_baseline_inference.py
+    |-- 02_make_attack_pool.py
+    |-- 02_make_exploratory_remaining_pool.py
+    |-- 03_classifier_wrapper.py
+    |-- 04_validity_checks.py
+    |-- 05_attack_pilot.py
+    |-- 06_budget_diagnostic.py
+    |-- 07_analysis_results.py
+    |-- 08_confidence_movement_analysis.py
+    |-- 08_create_results_figures.py
+    |-- 09_unified_figures.py
+    |-- freeze_sbert_model.py
+    |-- freeze_local_llm_model.py
+    `-- outputs/.gitkeep
 ```
 
-Large local files are intentionally excluded from Git. This includes dataset CSVs, model weights, local LLM folders, generated outputs, research-paper PDFs, and thesis drafts. See [`docs/LOCAL_ARTIFACTS.md`](docs/LOCAL_ARTIFACTS.md).
-
----
-
-## Local Artifact Layout
-
-The scripts expect this local folder structure next to `Scripts_code/`:
-
-```text
-Automated Deception Classifier (Projectfolder)/
-├── hippocorpus_training_truncated.csv
-├── hippocorpus_test_truncated.csv
-├── DistilBERT/
-│   ├── config.json
-│   ├── model.safetensors
-│   ├── special_tokens_map.json
-│   ├── tokenizer.json
-│   ├── tokenizer_config.json
-│   └── vocab.txt
-└── local_models/
-    ├── all-MiniLM-L6-v2/
-    ├── Qwen3-4B-Instruct-2507/
-    └── Qwen3-4B-Instruct-2507-GGUF/
-```
-
-These files are required locally but should not be committed.
-
----
+`Scripts_code/05_attack_pilot.py` has a historical filename; it is the main
+attack runner used for the final unified experiment. The two `08_*` scripts
+serve different post-hoc analysis/figure roles and retain their established
+names. Some scripts preserve earlier pilot configurations for provenance, but
+the final thesis-relevant analysis is `unified_llama70b_gen5_query5`.
 
 ## Installation
 
-Create and activate a virtual environment from the repository root:
+From the repository root:
 
 ```powershell
 python -m venv .venv
@@ -95,142 +92,65 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-For GPU-based Transformers inference, install a CUDA-enabled PyTorch build that matches the machine. The exact PyTorch command can depend on the local CUDA setup, so verify with:
+Install a CUDA-compatible PyTorch build separately if required by the local
+machine.
 
-```powershell
-python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+## Local artifacts
+
+Data, model weights, raw outputs, and generated paraphrases are intentionally
+not committed. The current code expects local data and models beneath:
+
+```text
+Automated Deception Classifier (Projectfolder)/
 ```
 
----
+See [docs/LOCAL_ARTIFACTS.md](docs/LOCAL_ARTIFACTS.md) for the expected paths.
 
-## Standard Pipeline
+## Pipeline
 
 Run commands from the repository root.
 
-### 1. Run baseline inference
-
 ```powershell
+# 1. Fixed-classifier baseline inference
 python Scripts_code\01_baseline_inference.py
-```
 
-This creates split-specific baseline predictions, summaries, and candidate pools in `Scripts_code/outputs/`.
-
-### 2. Freeze attack pools
-
-```powershell
+# 2. Construct/freeze attack pools
 python Scripts_code\02_make_attack_pool.py
+python Scripts_code\02_make_exploratory_remaining_pool.py
+
+# 3. Run the attack (historical filename, current main runner)
+python Scripts_code\05_attack_pilot.py --help
+
+# 4. Analyze the final unified output
+python Scripts_code\07_analysis_results.py `
+  --analysis unified_llama70b_gen5_query5
+
+# 5. Optional figures and diagnostics
+python Scripts_code\09_unified_figures.py
 ```
 
-This creates:
+The final attack command and operational safeguards are documented in
+[docs/RUNNING.md](docs/RUNNING.md). Do not rerun the completed experiment
+unless you intentionally want a new set of raw outputs.
 
-```text
-Scripts_code/outputs/candidate_pool_pilot_20.csv
-Scripts_code/outputs/candidate_pool_main_160.csv
-Scripts_code/outputs/candidate_pool_freeze_meta.json
-```
+## API-key safety
 
-Use `--overwrite` only when intentionally regenerating frozen pools.
-
-### 3. Run a small pilot smoke test
+Store the DeepInfra key only in an environment variable for the current shell:
 
 ```powershell
-python Scripts_code\05_attack_pilot.py `
-  --paraphraser placeholder `
-  --max-examples 2 `
-  --max-generation-attempts 3 `
-  --max-classifier-queries 3 `
-  --overwrite
+$env:DEEPINFRA_API_KEY = "your-key-here"
 ```
 
-This tests the attack loop without using a real LLM paraphraser.
+Pass the variable name with `--api-llm-key-env DEEPINFRA_API_KEY`. Never put a
+key in source code, command examples, tracked configuration, notebooks, or
+output files.
 
-### 4. Run invalid-candidate debug mode
+## Reproducibility and repository policy
 
-```powershell
-python Scripts_code\05_attack_pilot.py `
-  --paraphraser invalid_debug `
-  --max-examples 2 `
-  --max-generation-attempts 3 `
-  --max-classifier-queries 3 `
-  --overwrite
-```
+The comparison uses the same victim, examples, prompt family, generation
+settings, validity checks, budget, and stopping rules in both feedback
+conditions. Generated outputs are excluded from Git; the repository contains
+code, documentation, and aggregate results only.
 
-This verifies that invalid candidates are logged but not queried against the classifier.
-
-### 5. Run local LLM pilot mode
-
-For the real local LLM paraphraser, use `--paraphraser local_llm`. The current preferred backend is the local llama.cpp server backend, because it keeps generation local while avoiding the slow Transformers path.
-
-See [`docs/RUNNING.md`](docs/RUNNING.md) for full local LLM and llama.cpp instructions.
-
----
-
-## Success Definition
-
-An attack is counted as successful only when all of the following hold:
-
-1. the original example was correctly classified by the victim classifier;
-2. the generated paraphrase passes the validity checker;
-3. the victim classifier prediction flips;
-4. the flip occurs within the fixed classifier-query budget.
-
-The original-text verification query is logged separately and does not count against the attack budget. Invalid paraphrases are logged but are not sent to the classifier.
-
----
-
-## Main Outputs
-
-Generated files are written to `Scripts_code/outputs/` and are ignored by Git.
-
-Typical output groups:
-
-```text
-baseline_predictions_train_dev.csv
-candidate_pool_train_dev.csv
-baseline_summary_train_dev.json
-
-baseline_predictions_test_final.csv
-candidate_pool_test_final.csv
-baseline_summary_test_final.json
-
-candidate_pool_pilot_20.csv
-candidate_pool_main_160.csv
-candidate_pool_freeze_meta.json
-
-attack_attempts_pilot_<mode>.csv
-attack_results_pilot_<mode>.csv
-attack_pilot_meta_<mode>.json
-```
-
----
-
-## Reproducibility Notes
-
-The implementation uses:
-
-- stable local paths relative to the repository root;
-- explicit train/dev and test/final split names;
-- fixed seeds where sampling or generation control is used;
-- SHA-256 hashes for important file/model/prompt metadata where available;
-- overwrite protection for generated artifacts;
-- one shared validity checker across both feedback conditions;
-- one shared victim-model inference path across both feedback conditions.
-
-See [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md) for more detail.
-
----
-
-## Privacy and Repository Policy
-
-This repository should contain source code and documentation only. Do not commit:
-
-- dataset CSVs;
-- model weights;
-- Qwen/SBERT/GGUF local model files;
-- generated experiment outputs;
-- server logs;
-- thesis drafts;
-- professor feedback forms;
-- research-paper PDFs.
-
-The recommended GitHub setting is **private** until data/model licensing and supervisor expectations are fully clear.
+See [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md) for the frozen protocol
+and [docs/RUNNING.md](docs/RUNNING.md) for execution details.
