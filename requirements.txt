@@ -1,5 +1,7 @@
 # Core data handling
+numpy>=1.24
 pandas>=2.0
+matplotlib>=3.7
 
 # Model inference and local model loading
 torch
@@ -12,6 +14,7 @@ accelerate>=0.30
 tokenizers>=0.15
 sentencepiece>=0.2
 protobuf>=4.25
+tqdm>=4.66
 
 # Optional note:
 # bitsandbytes is only needed when using --local-llm-load-in-4bit or --local-llm-load-in-8bit.
